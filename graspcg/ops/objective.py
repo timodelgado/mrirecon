@@ -4,7 +4,7 @@ import torch
 from typing import Optional, Tuple
 from ..utils.operations import dot_chunked
 from ..ops.reg_registry import REG_HANDLERS
-
+from ..ops.reg_manager import RegManager
 class Objective:
     """
     Memory‑aware objective with arena‑backed scratch and NUFFT caches.
@@ -22,9 +22,10 @@ class Objective:
     • Regularisers are evaluated at x+t·d by temporarily pushing x and popping back.
     """
 
-    def __init__(self, nufft_op, y: torch.Tensor):
+    def __init__(self, nufft_op, y: torch.Tensor, regm: RegManager):
         self.nufft = nufft_op
         self.y     = y
+        self.regm  = regm
         # transient handles to arena scratch (set by begin_linesearch)
         self._Ax   : Optional[torch.Tensor] = None
         self._Adx  : Optional[torch.Tensor] = None
@@ -98,12 +99,7 @@ class Objective:
         for sh,_ in ws.iter_shards():
             sh.x.add_(sh.dx, alpha=float(t))
 
-        f_reg = 0.0
-        for key, cfg in ws.regs.items():
-            handler = REG_HANDLERS.get(key)
-            if handler is None or cfg.get("weight", 0.0) == 0.0:
-                continue
-            f_reg += float(handler(ws))  # handler adds ∇ into ws.g
+        f_reg = float(self.regm.energy_and_grad(ws))
 
         for sh,_ in ws.iter_shards():
             sh.x.add_(sh.dx, alpha=-float(t))  # pop

@@ -110,13 +110,6 @@ class ScaleField:
         # EMA in place on CPU master
         self._val.mul_(alpha).add_(v, alpha=(1.0 - alpha)).clamp_(min=1e-12)
         self._recompute_inv_s2()
-    # graspcg/workspace/scale.py  (inside ScaleField)
-    def s_for_shard(self, sh, *, anchor: torch.Tensor | None = None) -> torch.Tensor:
-        """Return per-batch scale (B_loc,1,1,...) on shard's device."""
-        dev = anchor.device if anchor is not None else sh.x.device
-        B_loc = sh.b_slice.stop - sh.b_slice.start
-        view = self.s[sh.b_slice]                 # (B_loc,)
-        return view.to(dev).view(B_loc, *([1]*self.inner_ndim))
     # alias (sometimes nicer to call)
     ema_update = update_ema
 

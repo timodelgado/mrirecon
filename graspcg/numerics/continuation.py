@@ -100,7 +100,7 @@ class ContinuationManager:
                 changed = True
 
         if changed and self.cfg.update_diag:
-            # refresh diagonal preconditioner in-place (no reallocation)
-            build_precond_diag(ws, mode="update")
+            build_precond_diag(ws, regm=self.regm, mode="update")
+
 
         return changed

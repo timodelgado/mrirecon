@@ -183,11 +183,26 @@ def reg_tv_t_diag_shard(ws: CGWorkspace, sh, diag: torch.Tensor) -> None:
     """Shard‑explicit diag helper; preferred when your preconditioner iterates shards."""
     TemporalTV.from_ws(ws).add_diag_shard(ws, sh, diag)
 
+# REPLACE the whole reg_tv_t_stats() in graspcg/ops/tvt.py with this:
+
 @register_stats("tv_t")
 @torch.no_grad()
-def reg_tv_t_stats(ws: CGWorkspace, xs: torch.Tensor, *, percentile: float, eps_floor: float):
-    """Stats helper used by init‑scaling / continuation."""
-    return TemporalTV.estimate_stats(ws, xs, percentile=percentile, eps_floor=eps_floor)
+def reg_tv_t_stats(ws: CGWorkspace,
+                   xs: torch.Tensor,
+                   *,
+                   percentile: float,
+                   eps_floor: float):
+    """
+    Temporal‑TV stats (ε, σ) computed on the provided pilot `xs`.
+
+    NOTE:
+      • This helper is intentionally SCALE‑AGNOSTIC.
+      • If your policy requires stats on u = x/s, scale `xs` *before*
+        calling this function (e.g., via ws.scale.divide_inplace(xs)).
+    """
+    return TemporalTV.estimate_stats(ws, xs,
+                                     percentile=percentile,
+                                     eps_floor=eps_floor)
 
 
 # ------------------------------ helpers --------------------------------

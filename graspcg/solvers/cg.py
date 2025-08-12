@@ -72,7 +72,7 @@ class CGSolver:
         self.regm = regm
 
         # Objective (stateless; uses ws + regm)
-        self.obj      = Objective(nufft_op, y, regm)
+        self.obj      = Objective(nufft_op, y, self.regm)
         self.dir_obj  = directions.build_direction(direction, self.ws)
 
         # Line‑search config
@@ -132,13 +132,7 @@ class CGSolver:
         for k in range(self.max_iter):
             # Evaluate along d via line‑search (objective provides f,g via caches)
             self.obj.begin_linesearch(ws)
-            ok, t, f_new, _ = line_search.search(
-                obj=self.obj, ws=ws,
-                f0=f0, g0d=g0d,
-                t_init=self.t_init, c1=self.c1, c2=self.c2,
-                max_iter=self.ls_max_iter, zoom=self.ls_zoom,
-                verbose=self.verbose
-            )
+            ok, t, f_new, _ = line_search.search(self, f0, g0d)
             self.obj.end_linesearch(ws)
 
             if not ok:
