@@ -8,9 +8,9 @@ from ..workspace.unified_arena import UnifiedArena
 from ..workspace.device_pool   import DevicePool
 from ..workspace.cg_workspace  import CGWorkspace
 
-from ..ops.reg_manager         import RegManager
+from ..regularization.reg_manager         import RegManager
 from ..ops.init_scaling        import initial_backproj_and_scaling
-from ..ops.preconditioner      import build_precond_diag
+from ..regularization.preconditioner      import build_precond_diag
 
 from ..solvers.cg              import CGSolver
 from ..numerics.continuation   import ContinuationConfig, ContinuationManager

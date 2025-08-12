@@ -9,7 +9,7 @@ once via the arena) and tiny scalars.  Reductions use dot_chunked().
 from __future__ import annotations
 import torch
 from typing import Dict, Callable, Optional
-from graspcg.utils.operations import dot_chunked
+from ..utils.operations import dot_chunked
 
 
 # ------------------------------- helpers ------------------------------------

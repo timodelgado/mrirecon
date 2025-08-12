@@ -3,8 +3,8 @@ from __future__ import annotations
 import torch
 from typing import Optional, Tuple
 from ..utils.operations import dot_chunked
-from ..ops.reg_registry import REG_HANDLERS
-from ..ops.reg_manager import RegManager
+from ..regularization.reg_registry import REG_HANDLERS
+from ..regularization.reg_manager import RegManager
 class Objective:
     """
     Memory‑aware objective with arena‑backed scratch and NUFFT caches.

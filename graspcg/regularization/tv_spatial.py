@@ -1,10 +1,10 @@
 from __future__ import annotations
 import math, torch
 from typing import Tuple, Optional
-from graspcg.workspace.cg_workspace   import CGWorkspace
-from graspcg.workspace.unified_arena  import UnifiedArena
-from graspcg.ops.reg_registry         import register, register_diag, register_stats, register_diag_shard
-from graspcg.utils.operations         import quantile
+from ..workspace.cg_workspace   import CGWorkspace
+from ..workspace.unified_arena  import UnifiedArena
+from .reg_registry         import register, register_diag, register_stats, register_diag_shard
+from ..utils.operations         import quantile
 
 class SpatialTV:
     """

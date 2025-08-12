@@ -3,9 +3,9 @@ from __future__ import annotations
 import math, torch
 from typing import Optional
 
-from graspcg.workspace.cg_workspace   import CGWorkspace
-from graspcg.workspace.unified_arena  import UnifiedArena
-from graspcg.ops.reg_registry         import (
+from ..workspace.cg_workspace   import CGWorkspace
+from ..workspace.unified_arena  import UnifiedArena
+from .reg_registry         import (
     register, register_diag, register_diag_shard, register_stats
 )
 from graspcg.utils.operations         import quantile

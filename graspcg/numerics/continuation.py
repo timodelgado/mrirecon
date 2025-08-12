@@ -5,8 +5,8 @@ from typing import Dict, Optional
 
 import torch
 
-from graspcg.ops.reg_registry   import STATS_HELPERS  # (ws, xs, percentile, eps_floor)->(eps,sigma)
-from graspcg.ops.preconditioner import build_precond_diag
+from ..regularization.reg_registry   import STATS_HELPERS  # (ws, xs, percentile, eps_floor)->(eps,sigma)
+from ..regularization.preconditioner import build_precond_diag
 
 
 @dataclass
