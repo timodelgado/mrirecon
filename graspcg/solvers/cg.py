@@ -6,7 +6,7 @@ from typing import Sequence, Optional, Mapping
 from ..workspace.device_cfg    import DeviceCfg
 from ..workspace.cg_workspace  import CGWorkspace
 from ..ops.objective           import Objective
-from ..ops.preconditioner      import build_precond_diag
+from ..regularization.preconditioner      import build_precond_diag
 from ..ops.init_scaling        import initial_backproj_and_scaling
 from ..numerics                import line_search, directions
 from ..numerics.continuation   import ContinuationManager, ContinuationConfig

@@ -1,10 +1,10 @@
 from __future__ import annotations
 import math, torch
 from typing import Tuple, Optional
+from .reg_registry         import register, register_diag, register_stats, register_diag_shard
 from ..workspace.cg_workspace   import CGWorkspace
 from ..workspace.unified_arena  import UnifiedArena
-from .reg_registry         import register, register_diag, register_stats, register_diag_shard
-from ..utils.operations         import quantile
+from ..utils.operations         import quantile, suggest_tile
 
 class SpatialTV:
     """
@@ -107,7 +107,7 @@ class SpatialTV:
 
         # choose tile along S1 (skip last slice)
         base = B * S2 * S3
-        tile_s1 = self.tile_s1 if self.tile_s1 is not None else _suggest_tile(
+        tile_s1 = self.tile_s1 if self.tile_s1 is not None else suggest_tile(
             base, arena, x.dtype, dev, user_default=max(1, S1-1)
         )
 
@@ -235,24 +235,7 @@ def stats_tv_spatial(ws: CGWorkspace, xs: torch.Tensor, *, percentile: float, ep
     return eps, sigma
 
 # ------------------------------ helpers -------------------------------
-def _suggest_tile(target_elems: int,
-                  arena: UnifiedArena,
-                  dtype,
-                  dev: torch.device,
-                  safety: float = 0.9,
-                  user_default: int | None = None) -> int:
-    if dev.type == "cpu":
-        return user_default or (1 << 30)
-    elem_size = torch.tensor([], dtype=dtype).element_size()
-    free_elems = arena.free_elems(dtype, device=dev)
-    free_bytes = free_elems * elem_size
-    if free_bytes == 0:
-        free_bytes, _ = torch.cuda.mem_get_info(dev)
-    cap = int(free_bytes * safety // (target_elems * elem_size))
-    tile = 1 << (cap.bit_length() - 1) if cap > 0 else 1
-    if user_default:
-        tile = min(tile, user_default)
-    return max(1, tile)
+
 
 @torch.no_grad()
 def _accum_spatial_grad(sh,

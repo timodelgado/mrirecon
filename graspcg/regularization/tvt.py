@@ -8,7 +8,7 @@ from ..workspace.unified_arena  import UnifiedArena
 from .reg_registry         import (
     register, register_diag, register_diag_shard, register_stats
 )
-from graspcg.utils.operations         import quantile
+from ..utils.operations         import quantile, suggest_tile
 
 
 class TemporalTV:
@@ -121,7 +121,7 @@ class TemporalTV:
         # Choose tile (# of frame-differences per sweep)
         tile = self.tile
         if tile is None:
-            tile = _suggest_tile(vox, arena, x.dtype, dev,
+            tile = suggest_tile(vox, arena, x.dtype, dev,
                                  user_default=max(1, B_loc - 1))
 
         # Scratch sized to the largest possible span this iter
@@ -231,25 +231,3 @@ def _accum_1d_grad(g: torch.Tensor,
         g[b0+1:b0+span].add_( (sign_dt[:-1] - sign_dt[1:]).mul_(lam).mul_(w[1:-1]) )
     g[b0+span].add_( sign_dt[-1].mul(lam).mul_(w[-1]) )
 
-
-def _suggest_tile(target_elems: int,
-                  arena: UnifiedArena,
-                  dtype,
-                  dev: torch.device,
-                  safety: float = 0.9,
-                  user_default: int | None = None) -> int:
-    """
-    Pick a power‑of‑two tile that fits free scratch; fall back to user_default.
-    """
-    if dev.type == "cpu":
-        return user_default or (1 << 30)
-    elem_size = torch.tensor([], dtype=dtype).element_size()
-    free_elems= arena.free_elems(dtype, device=dev)
-    free_bytes= free_elems * elem_size
-    if free_bytes == 0:
-        free_bytes, _ = torch.cuda.mem_get_info(dev)
-    cap  = int(free_bytes * safety // (target_elems * elem_size))
-    tile = 1 << (cap.bit_length()-1) if cap > 0 else 1
-    if user_default:
-        tile = min(tile, user_default)
-    return max(1, tile)

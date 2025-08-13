@@ -24,15 +24,11 @@ def register_diag(key: str):
         DIAG_HELPERS[key] = fn
         return fn
     return _decor
-# --- shard‑explicit diagonal helpers ---------------------------------
 
 def register_diag_shard(key: str):
-    """
-    Decorator for per‑shard diagonal builder:
-        fn(ws, sh, diag)  # diag belongs to this shard
-    """
+    """Decorator: register a shard‑explicit diagonal helper (ws, sh, diag)"""
     def _decor(fn):
-        DIAG_SHARD_HELPERS[key] = fn
+        DIAG_HELPERS_SHARD[key] = fn
         return fn
     return _decor
 # statistics helpers for init scaling / continuation: helper(ws, xs, **kw) -> (eps, sigma)
@@ -44,9 +40,3 @@ def register_stats(key: str):
         return fn
     return _decor
 
-def register_diag_shard(key: str):
-    """Decorator: register a shard‑explicit diagonal helper (ws, sh, diag)"""
-    def _decor(fn):
-        DIAG_HELPERS_SHARD[key] = fn
-        return fn
-    return _decor
