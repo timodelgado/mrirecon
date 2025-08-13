@@ -3,8 +3,8 @@ from __future__ import annotations
 import math, torch
 from dataclasses import dataclass
 from typing import Optional, Iterator, Tuple
-from .unified_arena import UnifiedArena
-from .device_cfg import DeviceCfg
+
+from .unified_arena import DeviceArena
 
 @dataclass
 class _FwdCache:
@@ -20,13 +20,12 @@ class _FwdCache:
 
 class CGWorkspace:
     def __init__(self, y: torch.Tensor, nufft_op,
-                 device_cfg: DeviceCfg,
-                 arena: UnifiedArena,
-                 *,
-                 direction: str = "prplus",
-                 dtype_c = torch.complex64,
-                 dtype_r = torch.float32):
-
+                arena: DeviceArena,
+                *,
+                direction: str = "prplus",
+                dtype_c = torch.complex64,
+                dtype_r = torch.float32):
+ 
         self.nufft_op = nufft_op
         self.y        = y
         self.arena    = arena
@@ -36,7 +35,7 @@ class CGWorkspace:
         self.direction = direction
 
         # shards: construct from your existing layout/sharding planner
-        self.shards = self._plan_shards(device_cfg)
+        self.shards = self._plan_shards(self.arena)
 
         # forward cache (k-space)
         self.cache = _FwdCache()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math, torch
 from typing import Sequence, Optional, Mapping
 
-from ..workspace.device_cfg    import DeviceCfg
+from ..workspace.unified_arena import DeviceArena
 from ..workspace.cg_workspace  import CGWorkspace
 from ..ops.objective           import Objective
 from ..regularization.preconditioner      import build_precond_diag
@@ -11,8 +11,6 @@ from ..ops.init_scaling        import initial_backproj_and_scaling
 from ..numerics                import line_search, directions
 from ..numerics.continuation   import ContinuationManager, ContinuationConfig
 from ..utils.operations        import dot_chunked
-from   ..workspace.device_pool import DevicePool
-from ..workspace.unified_arena import UnifiedArena
 
 class CGSolver:
     """
@@ -59,14 +57,10 @@ class CGSolver:
                  continuation: ContinuationManager | None = None,
                  verbose: bool    = False):
 
+        compute_spec = devices if devices is not None else "cuda"
+        self.arena = DeviceArena(compute=compute_spec)
+        self.ws    = CGWorkspace(y, nufft_op, arena=self.arena)
         # Device config + workspace
-        if devices is None:
-            device_cfg = DeviceCfg(devices)
-        else:
-            if isinstance(devices, (int, str)):
-                devices = [devices]
-            device_cfg = DeviceCfg(compute=devices[0], helpers=list(devices[1:]))
-        self.ws   = CGWorkspace(y, nufft_op, device_cfg=device_cfg)
         self.nuf  = nufft_op
         self.y    = y
         self.regm = regm
