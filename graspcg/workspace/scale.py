@@ -139,4 +139,9 @@ class ScaleField:
             self._cache_inv_s2[inv.device] = inv  # key by actual device
             self._dirty = False
         return self._cache_inv_s2[dev]
+
+    @torch.no_grad()
+    def invalidate(self):
+        self._cache_inv_s2.clear()
+        self._dirty = True
     

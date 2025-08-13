@@ -11,7 +11,8 @@ from ..ops.init_scaling        import initial_backproj_and_scaling
 from ..numerics                import line_search, directions
 from ..numerics.continuation   import ContinuationManager, ContinuationConfig
 from ..utils.operations        import dot_chunked
-
+from   ..workspace.device_pool import DevicePool
+from ..workspace.unified_arena import UnifiedArena
 
 class CGSolver:
     """
@@ -41,8 +42,8 @@ class CGSolver:
     def __init__(self,
                  nufft_op,
                  y: torch.Tensor,
-                 *,
                  regm,
+                 *,
                  devices: int|str|Sequence[int|str]|None = None,
                  line_search: str = "wolfe",
                  direction: str   = "prplus",
@@ -60,12 +61,11 @@ class CGSolver:
 
         # Device config + workspace
         if devices is None:
-            device_cfg = DeviceCfg()
+            device_cfg = DeviceCfg(devices)
         else:
             if isinstance(devices, (int, str)):
                 devices = [devices]
             device_cfg = DeviceCfg(compute=devices[0], helpers=list(devices[1:]))
-
         self.ws   = CGWorkspace(y, nufft_op, device_cfg=device_cfg)
         self.nuf  = nufft_op
         self.y    = y
@@ -176,25 +176,20 @@ class CGSolver:
     # ──────────────────────────────────────────────────────────────────────
     # Small helpers: all use arena‑aware dot to avoid transient megatensors
     # ──────────────────────────────────────────────────────────────────────
-    @torch.no_grad()
     def _g_dot_d(self) -> float:
         s = 0.0
         for sh, _ in self.ws.iter_shards():
-            # complex‑safe inner product; real scalar
-            val = dot_chunked(sh.g, sh.dx, arena=self.ws.arena)
-            s += float(val.real.item())
+            s += float(dot_chunked(sh.g, sh.dx, arena=self.ws.arena))
         return s
 
-    @torch.no_grad()
     def _x_norm(self) -> float:
         s = 0.0
         for sh, _ in self.ws.iter_shards():
-            s += float(dot_chunked(sh.x, sh.x, arena=self.ws.arena).real.item())
+            s += float(dot_chunked(sh.x, sh.x, arena=self.ws.arena))
         return math.sqrt(s)
 
-    @torch.no_grad()
     def _step_norm(self) -> float:
         s = 0.0
         for sh, _ in self.ws.iter_shards():
-            s += float(dot_chunked(sh.dx, sh.dx, arena=self.ws.arena).real.item())
+            s += float(dot_chunked(sh.dx, sh.dx, arena=self.ws.arena))
         return math.sqrt(s)

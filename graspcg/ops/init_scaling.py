@@ -1,40 +1,42 @@
-# graspcg/ops/init_scaling.py
 from __future__ import annotations
 import math, torch
 from typing import Mapping
 from graspcg.utils.operations import dot_chunked
 
 @torch.no_grad()
-def initial_backproj_and_scaling(
-    ws,
-    regm,
-    *,
-    xfactor: float = 1.0,
-    # per‑reg policy: {"tv_t": {"percentile":0.9,"eps_floor":1e-6,"kappa":1.0}, ...}
-    stats_cfg: Mapping[str, Mapping[str, float | bool]] | None = None,
-    verbose: bool = True,
-) -> dict:
-    """
-    Matched filter back‑projection and robust scaling. Then, for each
-    registered regulariser (that has a policy entry), estimate (ε,σ) and set λ=κ·σ.
-    """
-    # 1) back‑projection  A^H y -> x  (out=ws.x; no allocation)
-    ws.nufft_op.AH(ws.y, out=ws.x)
+def initial_backproj_and_scaling(ws, regm, *, xfactor: float = 1.0,
+                                 stats_cfg=None, verbose: bool = True) -> dict:
+    # 1) x := A^H y (shard-wise, in place)
+    b_off = 0
+    for sh, _ in ws.iter_shards():
+        B = sh.x.shape[0]
+        ws.nufft_op.AH(ws.y[b_off:b_off+B], out=sh.x)
+        b_off += B
 
-    # 2) energy‑normalise via single forward pass into arena scratch
+    # 2) Energy-normalise via a single forward into arena scratch
     E_data = dot_chunked(ws.y, ws.y, arena=ws.arena)
     kbuf = ws.arena.request(ws.y.numel(), ws.y.dtype, anchor=ws.y).view_as(ws.y)
-    ws.nufft_op.A(ws.x, out=kbuf)
+    kbuf.zero_()
+    b_off = 0
+    for sh, _ in ws.iter_shards():
+        B = sh.x.shape[0]
+        kpart = ws.arena.request(sh.x.numel(), ws.y.dtype, anchor=ws.y).view_as(sh.x)
+        ws.nufft_op.A(sh.x, out=kpart)
+        kbuf[b_off:b_off+B].add_(kpart)
+        ws.arena.release(kpart)
+        b_off += B
     E_est = dot_chunked(kbuf, kbuf, arena=ws.arena) + 1e-30
     ws.arena.release(kbuf)
 
-    ws.x.mul_(math.sqrt(xfactor * E_data / E_est))
+    # scale all shards uniformly
+    scale = math.sqrt(xfactor * E_data / E_est)
+    for sh, _ in ws.iter_shards():
+        sh.x.mul_(scale)
 
-    # 3) pilot for stats = x (each regulariser applies its own scale internally)
-    xs = ws.x
+    xs = next(ws.iter_shards())[0].x  # a shard-level pilot is sufficient
 
     chosen = {}
-    if stats_cfg:
+    if stats_cfg and hasattr(regm, "estimate_from_pilot"):
         chosen = regm.estimate_from_pilot(ws, xs, stats_cfg, verbose=verbose)
 
     return {"E_data": float(E_data), "reg_cfgs": chosen}

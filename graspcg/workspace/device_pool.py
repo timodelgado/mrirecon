@@ -31,7 +31,6 @@ class DevicePool:
             if t.dev.type == "cuda":
                 t.free, _ = torch.cuda.mem_get_info(t.dev)
             else:
-                import psutil
                 t.free = psutil.virtual_memory().available
 
     # ......................................................................

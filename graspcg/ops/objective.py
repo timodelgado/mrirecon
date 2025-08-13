@@ -1,4 +1,3 @@
-# graspcg/ops/objective.py
 from __future__ import annotations
 import torch
 from typing import Optional, Tuple
@@ -39,6 +38,7 @@ class Objective:
         """
         Prepare NUFFT caches: Ax and Adx, plus one residual buffer r(t).
         All allocations go through the arena and are released in end_linesearch.
+        Shard‑aware: accumulates A(x) and A(dx) over ws.iter_shards().
         """
         arena = ws.arena
         y     = self.y
@@ -48,11 +48,28 @@ class Objective:
         self._Adx = arena.request(y.numel(), y.dtype, anchor=y).view_as(y)
         self._r   = arena.request(y.numel(), y.dtype, anchor=y).view_as(y)
 
-        # Ax into scratch
-        self.nufft.A(ws.x, out=self._Ax)
+        # Zero once; then accumulate shard-by-shard
+        self._Ax.zero_()
+        self._Adx.zero_()
 
-        # Adx: forward of the direction (already preconditioned)
-        self.nufft.A(ws.dx, out=self._Adx)
+        # Accumulate Ax and Adx by slicing the leading (frame) axis
+        b_off = 0
+        for sh, _ in ws.iter_shards():
+            B = sh.x.shape[0]
+            tmp = arena.request(sh.x.numel(), y.dtype, anchor=y).view_as(sh.x)
+            self.nufft.A(sh.x, out=tmp)
+            self._Ax[b_off:b_off+B].add_(tmp)
+            arena.release(tmp)
+            b_off += B
+
+        b_off = 0
+        for sh, _ in ws.iter_shards():
+            B = sh.dx.shape[0]
+            tmp = arena.request(sh.dx.numel(), y.dtype, anchor=y).view_as(sh.dx)
+            self.nufft.A(sh.dx, out=tmp)
+            self._Adx[b_off:b_off+B].add_(tmp)
+            arena.release(tmp)
+            b_off += B
 
     @torch.no_grad()
     def end_linesearch(self, ws) -> None:
@@ -109,7 +126,5 @@ class Objective:
 
         gdot = 0.0
         for sh,_ in ws.iter_shards():
-            # local inner product Re⟨g, d⟩
-            gdot += (sh.g.conj() * sh.dx).real.sum().item()
-
+            gdot += float(dot_chunked(sh.g, sh.dx, arena=ws.arena))
         return f_total, float(gdot)

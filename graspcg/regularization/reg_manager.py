@@ -1,9 +1,27 @@
 # graspcg/ops/reg_manager.py
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Iterable
+from typing import Any, Dict, Iterable, Mapping, Protocol  # add Any, Mapping
 import torch
 
+# import registries if you need functional fallbacks
+from .reg_registry import DIAG_HELPERS, DIAG_HELPERS_SHARD  # if used below
+from .reg_factories import REG_CLASSES
+
+
+class _RegularizerProto(Protocol):
+    # Preferred shard-wise APIs (manager will iterate)
+    def energy_and_grad_shard(self, ws, sh) -> float: ...
+    def add_diag_shard(self, ws, sh, diag: torch.Tensor) -> None: ...
+    # Optional legacy APIs (kept for back-compat)
+    def energy_and_grad(self, ws) -> float: ...
+    def add_diag(self, ws, diag: torch.Tensor) -> None: ...
+    # Stats / params
+    def estimate_stats(self, ws, xs: torch.Tensor, *, percentile: float, eps_floor: float) -> tuple[float,float]: ...
+    def set_params(self, *, weight: float | None = None, eps: float | None = None): ...
+    
+    
+    
 # ---- Per-regularizer policy -----------------------------------------------
 @dataclass
 class RegPolicy:
@@ -58,6 +76,24 @@ class RegManager:
     def get(self, name: str):
         return self.regs[name]
 
+
+    @classmethod
+    def from_config(cls, regs_cfg: Dict[str, Dict[str, object]]) -> "RegManager":
+        regm = cls()
+        for key, cfg in regs_cfg.items():
+            Cls = REG_CLASSES.get(key)
+            if Cls is None:
+                raise KeyError(f"Unknown regularizer key: {key}")
+            if hasattr(Cls, "from_cfg"):
+                reg = Cls.from_cfg(cfg)
+            else:
+                try:
+                    reg = Cls(**cfg)
+                except TypeError:
+                    raise
+            regm.add(key, reg)
+        return regm
+    
     @torch.no_grad()
     def energy_and_grad(self, ws) -> float:
         total = 0.0
@@ -72,22 +108,21 @@ class RegManager:
         for _, reg in self.regs.items():
             if hasattr(reg, "add_diag"):
                 reg.add_diag(ws, diag)
+                
     @torch.no_grad()
-    def add_diag_shard(self, ws, sh, diag: torch.Tensor) -> None:
+    def add_diag_shard(self, ws, sh, diag):
         for name, reg in self.regs.items():
             if hasattr(reg, "add_diag_shard"):
                 reg.add_diag_shard(ws, sh, diag)
             elif hasattr(reg, "add_diag"):
                 reg.add_diag(ws, diag)
             else:
-                # Try functional handlers by name
-                fn = DIAG_SHARD_HELPERS.get(name) or DIAG_HELPERS.get(name)
+                # fall back to functional registry
+                fn = DIAG_HELPERS_SHARD.get(name) or DIAG_HELPERS.get(name)
                 if fn is not None:
-                    # shard‑explicit helper gets (ws, sh, diag); the older helper gets (ws, diag)
-                    try:
-                        fn(ws, sh, diag)
-                    except TypeError:
-                        fn(ws, diag)
+                    try: fn(ws, sh, diag)
+                    except TypeError: fn(ws, diag)
+                    
     @torch.no_grad()
     def estimate_from_pilot(
         self,

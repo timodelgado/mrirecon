@@ -117,7 +117,7 @@ class UnifiedArena:
             self._touch[id(buf)] = time.time()
             return buf[:numel]          # view
 
-        # --- need new slab ------------------------------------------------
+        # --- need new slab ---
         n_alloc = math.ceil(numel * (reserve_frac or self.reserve_frac))
         try_on_dev = (dev.type == "cuda")
 
@@ -133,22 +133,12 @@ class UnifiedArena:
 
         # allocate
         loc = dev if try_on_dev else "cpu"
-        buf = torch.empty(n_alloc, dtype=dtype,
-                          device=loc,
-                          pin_memory=(loc == "cpu"))
+        buf = torch.empty(n_alloc, dtype=dtype, device=loc, pin_memory=(loc == "cpu"))
 
-        # register in pool
-        n_elems = buf.numel()
-        idx = bisect.bisect_left(sizes, n_elems)
-        sizes.insert(idx, n_elems)
-        bufs.insert(idx, buf)
-        self._pools[key] = self._Pool(sizes, bufs)
+        # Do NOT register freshly allocated slabs in the free list.
+        # We only return a view to the caller; the slab becomes available
+        # to the pool when the caller explicitly releases the view.
         self._touch[id(buf)] = time.time()
-
-        # enforce per‑dtype byte cap
-        if self.max_bytes and buf.numel()*buf.element_size() > self.max_bytes:
-            self._evict_oldest(key)
-
         return buf[:numel]
 
     # ......................................................................

@@ -1,4 +1,3 @@
-# graspcg/ops/preconditioner.py
 from __future__ import annotations
 import torch
 from typing import Literal

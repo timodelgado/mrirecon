@@ -46,6 +46,13 @@ class TemporalTV:
             E += self._eval_shard(ws, sh)
         return float(E)
 
+    def set_params(self, *, weight: float | None = None, eps: float | None = None):
+        if weight is not None:
+            self.weight = float(weight)
+            # or self.lam     = float(weight)   # if you use lam internally
+        if eps is not None:
+            self.eps = float(eps)
+    
     @torch.no_grad()
     def add_diag_shard(self, ws: CGWorkspace, sh, diag: torch.Tensor) -> None:
         """
@@ -165,6 +172,12 @@ class TemporalTV:
 
 
 # ---------------------------- registry glue ----------------------------
+
+# Inside class TemporalTV
+@torch.no_grad()
+def energy_and_grad_shard(self, ws: CGWorkspace, sh) -> float:
+    return float(self._eval_shard(ws, sh))
+
 @register("tv_t")
 @torch.no_grad()
 def reg_tv_t(ws: CGWorkspace) -> float:

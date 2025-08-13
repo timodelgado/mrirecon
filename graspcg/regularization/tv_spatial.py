@@ -28,7 +28,35 @@ class SpatialTV:
                    voxel_size=tuple(cfg["voxel_size"]),
                    tile_s1=cfg.get("tile_s1"),
                    apply_scale=bool(cfg.get("apply_scale", True)))
+    # Inside class SpatialTV (below from_ws)
+    @classmethod
+    def from_cfg(cls, cfg: dict) -> "SpatialTV":
+        return cls(weight=float(cfg["weight"]),
+                eps=float(cfg["eps"]),
+                voxel_size=tuple(cfg["voxel_size"]),
+                tile_s1=cfg.get("tile_s1"),
+                apply_scale=bool(cfg.get("apply_scale", True)))
 
+    @torch.no_grad()
+    def energy_and_grad_shard(self, ws: CGWorkspace, sh) -> float:
+        return float(self._eval_shard(ws, sh))
+
+    @torch.no_grad()
+    def estimate_stats(self, ws: CGWorkspace, xs: torch.Tensor, *, percentile: float, eps_floor: float):
+        if xs.ndim < 4:
+            return max(eps_floor, 1e-6), 0.0
+        if self.apply_scale:
+            s = ws.scale.as_tensor().to(xs.real.dtype).to(xs.device)
+            s = s[: xs.shape[0]].view(xs.shape[0], *([1] * (xs.ndim - 1)))
+            xs = xs / s
+        g1 = xs.diff(dim=1).abs().div_(self.d1)
+        g2 = xs.diff(dim=2).abs().div_(self.d2)
+        g3 = xs.diff(dim=3).abs().div_(self.d3)
+        d_abs = torch.cat([g1.reshape(-1), g2.reshape(-1), g3.reshape(-1)])
+        eps   = max(quantile(d_abs, percentile).item(), eps_floor)
+        med   = quantile(d_abs, 0.5).item()
+        sigma = quantile((d_abs - med).abs(), 0.5).item() / 0.6745
+        return eps, sigma
     def __init__(self,
                  weight: float,
                  eps: float,
@@ -40,7 +68,13 @@ class SpatialTV:
         self.d1, self.d2, self.d3 = [float(v) for v in voxel_size]
         self.tile_s1 = tile_s1
         self.apply_scale = bool(apply_scale)
-
+        
+    def set_params(self, *, weight: float | None = None, eps: float | None = None):
+        if weight is not None:
+            self.lam = float(weight)
+        if eps is not None:
+            self.eps = float(eps)
+        
     @torch.no_grad()
     def energy_and_grad(self, ws: CGWorkspace) -> float:
         E = 0.0
@@ -192,6 +226,11 @@ class SpatialTV:
         return E
 
 # --------------------------- registry glue ----------------------------
+# inside SpatialTV
+@torch.no_grad()
+def energy_and_grad_shard(self, ws, sh) -> float:
+    return float(self._eval_shard(ws, sh))
+
 @register("tv_s")
 @torch.no_grad()
 def tv_spatial(ws: CGWorkspace) -> float:
@@ -211,28 +250,8 @@ def diag_tv_spatial_shard(ws: CGWorkspace, sh, diag: torch.Tensor):
 @register_stats("tv_s")
 @torch.no_grad()
 def stats_tv_spatial(ws: CGWorkspace, xs: torch.Tensor, *, percentile: float, eps_floor: float):
-    """
-    Percentile/MAD on spatial diffs. If tv_s.apply_scale=True, stats are
-    computed on u = x/s (per‑batch division). Includes voxel anisotropy.
-    """
-    if xs.ndim < 4:
-        return max(eps_floor, 1e-6), 0.0
-
-    cfg  = ws.regs.get("tv_s", {})
-    d1, d2, d3 = map(float, cfg.get("voxel_size", (1.0, 1.0, 1.0)))
-    if bool(cfg.get("apply_scale", True)):
-        s = ws.scale.as_tensor().to(xs.real.dtype).to(xs.device)
-        s = s[: xs.shape[0]].view(xs.shape[0], *([1] * (xs.ndim - 1)))
-        xs = xs / s
-
-    g1 = xs.diff(dim=1).abs().div_(d1)
-    g2 = xs.diff(dim=2).abs().div_(d2)
-    g3 = xs.diff(dim=3).abs().div_(d3)
-    d_abs = torch.cat([g1.reshape(-1), g2.reshape(-1), g3.reshape(-1)])
-    eps   = max(quantile(d_abs, percentile).item(), eps_floor)
-    med   = quantile(d_abs, 0.5).item()
-    sigma = quantile((d_abs - med).abs(), 0.5).item() / 0.6745
-    return eps, sigma
+    tv = SpatialTV.from_ws(ws)
+    return tv.estimate_stats(ws, xs, percentile=percentile, eps_floor=eps_floor)
 
 # ------------------------------ helpers -------------------------------
 
