@@ -45,7 +45,7 @@ def get_ktraj2D_cufi(Ndth, Ndr, device = "cuda"):
     return ktraj
 
 @torch.no_grad()
-def get_dcomp_2d(ktraj,dtype = torch.complex64):
+def get_dcomp_2d(ktraj,dtype = torch.float32):
     """
     ktraj can have shape:
       (2, #samples) 
@@ -87,21 +87,61 @@ def get_dcomp_2d(ktraj,dtype = torch.complex64):
     return dcomp_torch
 
 @torch.no_grad()
-def frame_scaling(organized_k_space):
-    # Calculate scaling factor 
-    s_t = cp.array(organized_k_space.view(organized_k_space.shape[0],-1).abs().pow(2).mean(1).sqrt())
-    s_t /= s_t.mean()                               # normalise
-    s_cpu = cp.asnumpy(s_t)
-    s_cpu = medfilt(s_cpu, 15)
-    s_cpu = savgol_filter(s_cpu, window_length=121, polyorder=3)
-    s_t = cp.asarray(s_cpu, dtype=s_t.dtype)
-    #s_t = cp.clip(s_t, a_min=None, a_max=None)
-    s_t /= s_t.mean()                               # renormalise
-    s_t = torch.as_tensor(s_t, dtype=torch.float32,
-                        device=organized_k_space.device).view(-1,1,1,1).detach().requires_grad_(False)
+def frame_scaling(organized_k_space: torch.Tensor) -> torch.Tensor:
+    """
+    Compute a per-frame scaling estimate from organized k-space.
 
-    del s_cpu
-    return s_t
+    Input shape (view-friendly):
+        organized_k_space: (Nframes, Nch, Ndz, W, Ndr)  [complex]
+    Output:
+        (Nframes,)  float tensor on the same device as input
+    """
+    x = organized_k_space
+
+    # Power per frame (handle non-contiguous/as_strided views safely)
+    # mean over all dims except frame; sqrt to get RMS-like scale
+    pow_per_frame = x.abs().pow(2).reshape(x.shape[0], -1).mean(dim=1).sqrt()
+
+    # Move to CPU numpy for SciPy filters (optional)
+    s = pow_per_frame.detach().float().cpu().numpy()  # shape: (Nframes,)
+    L = int(s.shape[0])
+
+    # Nothing to smooth / trivial cases
+    if L <= 1:
+        return pow_per_frame  # already on correct device/dtype
+    if L == 2:
+        # simple 2-point average smooth
+        s = (s + s[::-1]) * 0.5
+        return torch.from_numpy(s).to(organized_k_space.device, dtype=pow_per_frame.dtype)
+
+    # Helper to get the largest odd <= n
+    def odd_le(n: int) -> int:
+        return n if (n % 2 == 1) else (n - 1)
+
+    try:
+        from scipy.signal import medfilt, savgol_filter
+
+        # ---- Median filter with adaptive kernel (odd, <= L)
+        k_med_desired = 15
+        k_med = odd_le(min(k_med_desired, L))
+        if k_med >= 3:
+            s = medfilt(s, kernel_size=k_med)
+
+        # ---- Savitzky–Golay with adaptive window (odd, <= L)
+        w_sg_desired = 121
+        w_sg = odd_le(min(w_sg_desired, L))
+        # polyorder must be < window_length
+        p_sg_desired = 3
+        p_sg = min(p_sg_desired, max(1, w_sg - 1))
+        if w_sg >= 3 and p_sg >= 1:
+            s = savgol_filter(s, window_length=w_sg, polyorder=p_sg)
+        # else: series too short; keep median-filtered (or raw) s
+
+    except Exception:
+        print('SciPy not available or filtering failed; keep raw per-frame RMS')
+        pass
+
+    return torch.from_numpy(s).to(organized_k_space.device, dtype=pow_per_frame.dtype)
 
 
 

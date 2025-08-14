@@ -1,174 +1,124 @@
-# graspcg/numerics/directions.py
-"""
-Shard‑aware direction‑update classes that cooperate with CGWorkspace /
-UnifiedArena.  No global ws.dx/diag assumptions—everything is per‑shard.
-
-All large buffers are avoided; we only keep per‑shard g_prev (allocated
-once via the arena) and tiny scalars.  Reductions use dot_chunked().
-"""
 from __future__ import annotations
+from typing import Optional, Any
+
 import torch
-from typing import Dict, Callable, Optional
-from ..utils.operations import dot_chunked
 
-
-# ------------------------------- helpers ------------------------------------
-def _ensure_shard_like(ws, sh, attr: str, like: torch.Tensor) -> torch.Tensor:
-    """
-    Ensure shard `sh` has a tensor attribute `attr` shaped like `like`.
-    Allocate once via the arena (anchored on `like`) if missing/mismatch.
-    """
-    buf = getattr(sh, attr, None)
-    if (buf is None) or (buf.shape != like.shape) or (buf.dtype != like.dtype) \
-       or (buf.device != like.device):
-        buf = ws.arena.request(like.numel(), like.dtype, anchor=like).view_as(like)
-        setattr(sh, attr, buf)
-    return buf
+# Try to import dot_chunked; fall back to simple impl
+try:
+    from .dot import dot_chunked
+except Exception:
+    try:
+        from ..ops.dot import dot_chunked
+    except Exception:
+        def dot_chunked(a, b, *, diag=None, arena=None):
+            z = (a.conj() * b).real
+            return z.sum() if diag is None else (z / diag).sum()
 
 
 def _sum_over_shards(ws, fn) -> float:
-    """
-    Call `fn(sh)` for each shard, sum the scalar results (Python float).
-    Guaranteed not to allocate large temporaries.
-    """
     s = 0.0
-    for sh, _ in ws.iter_shards():
-        s += float(fn(sh))
+    for sh, i in ws.iter_shards():
+        s += float(fn(i))
     return s
 
 
 def _g_dot_d(ws) -> float:
-    """Compute Σ_sh ⟨g, d⟩ (unweighted) via dot_chunked per shard."""
-    return _sum_over_shards(ws, lambda sh: dot_chunked(sh.g, sh.dx, arena=ws.arena))
+    return _sum_over_shards(ws, lambda i:
+        dot_chunked(ws.get("g", i), ws.get("dx", i), arena=ws.arena))
 
 
-# --------------------------------- base --------------------------------------
 class _BaseDir:
-    """
-    Base class with shard‑aware lifecycle. Subclasses implement `_beta(ws)`.
-    """
     def __init__(self, ws):
         self.ws = ws
+        self._rho_prev: Optional[float] = None
 
+    @torch.no_grad()
     def init_state(self, g0: Optional[torch.Tensor] = None) -> float:
-        """
-        Prepare per‑shard state once. Returns current gᵀd to seed line search.
-        """
-        # Default: nothing required; subclasses may override.
+        """Return g·d at t=0 after seeding any needed state."""
         return _g_dot_d(self.ws)
-
-    def _beta(self, ws) -> float:
-        raise NotImplementedError
 
     @torch.no_grad()
     def update_inplace(self, ws) -> float:
-        """
-        Compute β from current shard gradients, update every shard’s d in‑place:
-            d ← β d − M^{-1} g
-        Return new gᵀd for the line search.
-        """
-        β = max(self._beta(ws), 0.0)
-
-        # Update each shard’s direction: d = β d − M^{-1} g  (no big temps)
-        for sh, _ in ws.iter_shards():
-            # d *= β
-            sh.dx.mul_(β)
-            # d += - (g / diag)  (complex / real) without allocating big temporaries
-            # addcdiv_: self += value * (tensor1 / tensor2)
-            sh.dx.addcdiv_(sh.g, sh.diag, value=-1.0)
-
-        # return the fresh directional derivative
-        return _g_dot_d(ws)
+        raise NotImplementedError
 
 
-# ----------------------------- Polak–Ribière+ --------------------------------
 class DirPRPlus(_BaseDir):
     @torch.no_grad()
     def init_state(self, g0: Optional[torch.Tensor] = None) -> float:
-        # Ensure and seed per‑shard g_prev
-        for sh, _ in self.ws.iter_shards():
-            gp = _ensure_shard_like(self.ws, sh, "g_prev", sh.g)
-            gp.copy_(sh.g)
+        # Seed g_prev from current g (manifest must include 'g_prev')
+        for sh, i in self.ws.iter_shards():
+            g, gp = self.ws.bind(i, "g", "g_prev")
+            gp.copy_(g)
         return _g_dot_d(self.ws)
 
-    def _beta(self, ws) -> float:
-        tiny = 1e-15
-        # β = max( (gᵀM^{-1}g − g_prevᵀM^{-1}g) / (g_prevᵀM^{-1}g_prev), 0 )
-        num = _sum_over_shards(ws, lambda sh:
-            dot_chunked(sh.g, sh.g, diag=sh.diag, arena=ws.arena)
-            - dot_chunked(sh.g_prev, sh.g, diag=sh.diag, arena=ws.arena))
+    @torch.no_grad()
+    def update_inplace(self, ws) -> float:
+        # β_PR+ = (gᵀM^{-1}g − g_prevᵀM^{-1}g) / (g_prevᵀM^{-1}g_prev)
+        num = _sum_over_shards(ws, lambda i:
+            dot_chunked(ws.get("g", i), ws.get("g", i),
+                        diag=ws.get("diag", i), arena=ws.arena)
+            - dot_chunked(ws.get("g_prev", i), ws.get("g", i),
+                          diag=ws.get("diag", i), arena=ws.arena))
+        den = _sum_over_shards(ws, lambda i:
+            dot_chunked(ws.get("g_prev", i), ws.get("g_prev", i),
+                        diag=ws.get("diag", i), arena=ws.arena))
+        β = max(0.0, float(num / max(den, 1e-20)))
 
-        den = _sum_over_shards(ws, lambda sh:
-            dot_chunked(sh.g_prev, sh.g_prev, diag=sh.diag, arena=ws.arena))
-
-        β = num / max(den, tiny)
-
-        # Update g_prev for next iteration (after β computed)
-        for sh, _ in ws.iter_shards():
-            sh.g_prev.copy_(sh.g)
+        for sh, i in ws.iter_shards():
+            g, d, D = ws.bind(i, "g", "dx", "diag")
+            d.mul_(β)
+            d.addcdiv_(g, D, value=-1.0)
+        for sh, i in ws.iter_shards():
+            g, gp = ws.bind(i, "g", "g_prev")
+            gp.copy_(g)
         return β
 
 
-# ----------------------------- Dai–Yuan (PCG) --------------------------------
 class DirDY(_BaseDir):
     @torch.no_grad()
     def init_state(self, g0: Optional[torch.Tensor] = None) -> float:
-        for sh, _ in self.ws.iter_shards():
-            gp = _ensure_shard_like(self.ws, sh, "g_prev", sh.g)
-            gp.copy_(sh.g)
+        for sh, i in self.ws.iter_shards():
+            g, gp = self.ws.bind(i, "g", "g_prev")
+            gp.copy_(g)
         return _g_dot_d(self.ws)
-
-    def _beta(self, ws) -> float:
-        tiny = 1e-15
-        # β = (gᵀM^{-1}g) / (dᵀ(g − g_prev))
-        num = _sum_over_shards(ws, lambda sh:
-            dot_chunked(sh.g, sh.g, diag=sh.diag, arena=ws.arena))
-
-        den = _sum_over_shards(ws, lambda sh:
-            dot_chunked(sh.dx, sh.g, arena=ws.arena)
-            - dot_chunked(sh.dx, sh.g_prev, arena=ws.arena))
-
-        β = num / max(den, tiny)
-
-        for sh, _ in ws.iter_shards():
-            sh.g_prev.copy_(sh.g)
-        return β
-
-
-# --------------------------- Fletcher–Reeves (PCG) ---------------------------
-class DirFR(_BaseDir):
-    def __init__(self, ws):
-        super().__init__(ws)
-        self._rho_prev = None  # scalar
 
     @torch.no_grad()
-    def init_state(self, g0: Optional[torch.Tensor] = None) -> float:
-        # ρ₀ = Σ_sh g₀ᵀM^{-1}g₀
-        self._rho_prev = _sum_over_shards(self.ws, lambda sh:
-            dot_chunked(sh.g, sh.g, diag=sh.diag, arena=self.ws.arena))
-        return _g_dot_d(self.ws)
+    def update_inplace(self, ws) -> float:
+        # β_DY = (gᵀM^{-1}g) / (dᵀ(g − g_prev))
+        num = _sum_over_shards(ws, lambda i:
+            dot_chunked(ws.get("g", i), ws.get("g", i),
+                        diag=ws.get("diag", i), arena=ws.arena))
+        den = _sum_over_shards(ws, lambda i:
+            dot_chunked(ws.get("dx", i), ws.get("g", i), arena=ws.arena)
+            - dot_chunked(ws.get("dx", i), ws.get("g_prev", i), arena=ws.arena))
+        β = float(num / max(den, 1e-20))
 
-    def _beta(self, ws) -> float:
-        tiny = 1e-15
-        rho_k = _sum_over_shards(ws, lambda sh:
-            dot_chunked(sh.g, sh.g, diag=sh.diag, arena=ws.arena))
-        if self._rho_prev is None:
-            β = 0.0
-        else:
-            β = rho_k / max(self._rho_prev, tiny)
-        self._rho_prev = rho_k
+        for sh, i in ws.iter_shards():
+            g, d, D = ws.bind(i, "g", "dx", "diag")
+            d.mul_(β)
+            d.addcdiv_(g, D, value=-1.0)
+        for sh, i in ws.iter_shards():
+            g, gp = ws.bind(i, "g", "g_prev")
+            gp.copy_(g)
         return β
 
 
-# -------------------------------- factory -----------------------------------
-_FACTORY: Dict[str, Callable[[object], _BaseDir]] = {
-    "prplus": DirPRPlus,
-    "dy":     DirDY,
-    "fr":     DirFR,
-}
+class DirFR(_BaseDir):
+    @torch.no_grad()
+    def update_inplace(self, ws) -> float:
+        # β_FR = (gᵀM^{-1}g) / (g_prevᵀM^{-1}g_prev)  (with rho cache)
+        if self._rho_prev is None:
+            self._rho_prev = _sum_over_shards(ws, lambda i:
+                dot_chunked(ws.get("g", i), ws.get("g", i),
+                            diag=ws.get("diag", i), arena=ws.arena))
+        rho_k = _sum_over_shards(ws, lambda i:
+            dot_chunked(ws.get("g", i), ws.get("g", i),
+                        diag=ws.get("diag", i), arena=ws.arena))
+        β = float(rho_k / max(self._rho_prev, 1e-20))
+        self._rho_prev = rho_k
 
-def build_direction(name: str, ws):
-    try:
-        return _FACTORY[name](ws)
-    except KeyError:
-        raise ValueError(f"unknown direction '{name}'")
+        for sh, i in ws.iter_shards():
+            g, d, D = ws.bind(i, "g", "dx", "diag")
+            d.mul_(β)
+            d.addcdiv_(g, D, value=-1.0)
+        return β

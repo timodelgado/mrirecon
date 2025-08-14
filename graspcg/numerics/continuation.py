@@ -47,9 +47,10 @@ class ContinuationManager:
 
         if any_scaled:
             # place scaled pilot in ws.dx shard-by-shard to avoid allocations
-            for sh, _ in ws.iter_shards():
-                sh.dx.copy_(sh.x)
-                ws.scale.divide_inplace(sh.dx)
+            for sh, i in ws.iter_shards():
+                x, dx = ws.bind(i, "x","dx")
+                dx.copy_(x)
+                ws.scale.divide_inplace(dx)
 
         changed = False
 
@@ -70,11 +71,12 @@ class ContinuationManager:
             # Aggregate stats across shards without materialising big tensors
             # We take a simple mean across shards (streaming). This is robust and cheap.
             eps_acc, sig_acc, n_shards = 0.0, 0.0, 0
-            for sh, _ in ws.iter_shards():
-                xs = sh.dx if apply_scale and any_scaled else sh.x
+            for sh, i in ws.iter_shards():
+                x, dx = ws.bind(i, "x","dx")
+                xs = dx if apply_scale and any_scaled else x
                 eps_i, sigma_i = helper(ws, xs,
-                                        percentile=percentile,
-                                        eps_floor=eps_floor)
+                                         percentile=percentile,
+                                         eps_floor=eps_floor)
                 eps_acc += float(eps_i)
                 sig_acc += float(sigma_i)
                 n_shards += 1

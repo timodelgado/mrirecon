@@ -1,130 +1,147 @@
 from __future__ import annotations
+from typing import Optional, Tuple, Any
+
 import torch
-from typing import Optional, Tuple
-from ..utils.operations import dot_chunked
-from ..regularization.reg_registry import REG_HANDLERS
-from ..regularization.reg_manager import RegManager
+
+# Try to import dot_chunked from your repo; fall back to a simple impl.
+try:
+    from ..numerics.dot import dot_chunked  # if you have this
+except Exception:
+    try:
+        from ..ops.dot import dot_chunked    # or this path
+    except Exception:
+        def dot_chunked(a, b, *, diag=None, arena=None):
+            z = (a.conj() * b).real
+            return z.sum() if diag is None else (z / diag).sum()
+
+
 class Objective:
     """
-    Memory‑aware objective with arena‑backed scratch and NUFFT caches.
+    Uses per-shard k-space caches if present in Workspace:
+      - 'Ax_sh', 'Ad_sh', 'r_sh'  (preferred; no P2P)
+    Else falls back to a global scratch anchored on y.device.
 
-    API
-    ---
-    begin_linesearch(ws):  precompute Ax, Adx once (scratch in arena)
-    f_g(ws, t) -> (f_total, gdot):  compute φ(t) and φ'(t)=g(t)^T d
-    end_linesearch(ws):    release scratch
-
-    Notes
-    -----
-    • No big persistent buffers; all scratch is via ws.arena.
-    • Data term uses linearity: Ax, Adx cached -> residual r(t) without re‑NUFFT.
-    • Regularisers are evaluated at x+t·d by temporarily pushing x and popping back.
+    Regularizer contract:
+      regm.energy_and_grad(ws): add reg energy to return, and accumulate into 'g' buffers.
     """
-
-    def __init__(self, nufft_op, y: torch.Tensor, regm: RegManager):
+    def __init__(self, nufft_op, y: torch.Tensor, regm):
         self.nufft = nufft_op
         self.y     = y
         self.regm  = regm
-        # transient handles to arena scratch (set by begin_linesearch)
+
         self._Ax   : Optional[torch.Tensor] = None
         self._Adx  : Optional[torch.Tensor] = None
         self._r    : Optional[torch.Tensor] = None
+        self._use_sharded: bool = False
 
-    # ──────────────────────────────────────────────────────────────────────
-    # LS lifecycle
-    # ──────────────────────────────────────────────────────────────────────
-    @torch.no_grad()
     def begin_linesearch(self, ws) -> None:
         """
-        Prepare NUFFT caches: Ax and Adx, plus one residual buffer r(t).
-        All allocations go through the arena and are released in end_linesearch.
-        Shard‑aware: accumulates A(x) and A(dx) over ws.iter_shards().
+        Prepare caches. If per-shard k-space caches ('Ax_sh','Ad_sh','r_sh') exist
+        in the workspace manifest, use them. Otherwise fall back to a global scratch.
         """
         arena = ws.arena
         y     = self.y
 
-        # k-space scratch
+        # Prefer sharded k-space caches if present
+        have_sharded = all(n in ws.list_bufs() for n in ("Ax_sh", "Ad_sh", "r_sh"))
+        self._use_sharded = bool(have_sharded)
+
+        if self._use_sharded:
+            for sh, i in ws.iter_shards():
+                x, dx        = ws.bind(i, "x", "dx")
+                Ax_sh, Ad_sh = ws.bind(i, "Ax_sh", "Ad_sh")
+                self.nufft.A(x,  out=Ax_sh)
+                self.nufft.A(dx, out=Ad_sh)
+            self._Ax = self._Adx = self._r = None
+            return
+
+        # Global scratch path (anchored on y.device), careful with cross-device compute
         self._Ax  = arena.request(y.numel(), y.dtype, anchor=y).view_as(y)
         self._Adx = arena.request(y.numel(), y.dtype, anchor=y).view_as(y)
         self._r   = arena.request(y.numel(), y.dtype, anchor=y).view_as(y)
 
-        # Zero once; then accumulate shard-by-shard
-        self._Ax.zero_()
-        self._Adx.zero_()
-
-        # Accumulate Ax and Adx by slicing the leading (frame) axis
         b_off = 0
-        for sh, _ in ws.iter_shards():
-            B = sh.x.shape[0]
-            tmp = arena.request(sh.x.numel(), y.dtype, anchor=y).view_as(sh.x)
-            self.nufft.A(sh.x, out=tmp)
-            self._Ax[b_off:b_off+B].add_(tmp)
-            arena.release(tmp)
+        for sh, i in ws.iter_shards():
+            x  = ws.get("x", i)
+            B  = int(x.shape[0])
+            ys = y[b_off:b_off+B]
+            tmp_local = arena.request(ys.numel(), y.dtype, device=x.device).view_as(ys)
+            self.nufft.A(x, out=tmp_local)
+            self._Ax[b_off:b_off+B].copy_(tmp_local.to(self._Ax.device, non_blocking=True))
+            arena.release(tmp_local)
             b_off += B
 
         b_off = 0
-        for sh, _ in ws.iter_shards():
-            B = sh.dx.shape[0]
-            tmp = arena.request(sh.dx.numel(), y.dtype, anchor=y).view_as(sh.dx)
-            self.nufft.A(sh.dx, out=tmp)
-            self._Adx[b_off:b_off+B].add_(tmp)
-            arena.release(tmp)
+        for sh, i in ws.iter_shards():
+            dx = ws.get("dx", i)
+            B  = int(dx.shape[0])
+            ys = y[b_off:b_off+B]
+            tmp_local = arena.request(ys.numel(), y.dtype, device=dx.device).view_as(ys)
+            self.nufft.A(dx, out=tmp_local)
+            self._Adx[b_off:b_off+B].copy_(tmp_local.to(self._Adx.device, non_blocking=True))
+            arena.release(tmp_local)
             b_off += B
 
-    @torch.no_grad()
     def end_linesearch(self, ws) -> None:
-        """Release LS scratch back to arena."""
+        """Release LS scratch. No-op when using per-shard caches."""
+        if self._use_sharded:
+            return
         arena = ws.arena
         if self._Ax is not None:  arena.release(self._Ax);  self._Ax  = None
         if self._Adx is not None: arena.release(self._Adx); self._Adx = None
         if self._r is not None:   arena.release(self._r);   self._r   = None
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Objective at x + t·d
-    # ──────────────────────────────────────────────────────────────────────
     @torch.no_grad()
     def f_g(self, ws, t: float) -> Tuple[float, float]:
         """
         Evaluate total objective φ(t) and φ'(t)=g(t)^T d at x + t·d.
-        Fills ws.g with the full gradient (data + regs) at x + t·d.
+        Fills per-shard 'g' with data+reg gradients at x + t·d.
         """
-        assert self._Ax is not None and self._Adx is not None and self._r is not None, \
-               "call begin_linesearch() before f_g"
-
         # 0) clear gradient
-        for sh,_ in ws.iter_shards():
-            sh.g.zero_()
+        for sh, i in ws.iter_shards():
+            ws.get("g", i).zero_()
 
         # 1) Data term via caches
-        r = self._r
-        # r(t) = Ax + t·Adx − y   (in place on scratch)
-        r.copy_(self._Ax).add_(self._Adx, alpha=float(t)).sub_(self.y)
+        if self._use_sharded:
+            f_data = 0.0
+            b_off = 0
+            for sh, i in ws.iter_shards():
+                Ax, Ad, r = ws.bind(i, "Ax_sh", "Ad_sh", "r_sh")
+                B = int(Ax.shape[0])
+                r.copy_(Ax).add_(Ad, alpha=float(t))
+                y_slice = self.y[b_off:b_off+B]
+                if y_slice.device != r.device:
+                    y_slice = y_slice.to(r.device, non_blocking=True)
+                r.sub_(y_slice)
+                f_data += float(dot_chunked(r, r, arena=ws.arena))
+                # data-grad
+                g = ws.get("g", i)
+                self.nufft.AH(r, out=g)
+                b_off += B
+            f_data *= 0.5
+        else:
+            r = self._r
+            r.copy_(self._Ax).add_(self._Adx, alpha=float(t)).sub_(self.y)
+            f_data = 0.5 * float(dot_chunked(r, r, arena=ws.arena))
+            b_off = 0
+            for sh, i in ws.iter_shards():
+                g = ws.get("g", i)
+                B = int(g.shape[0])
+                self.nufft.AH(r[b_off:b_off+B], out=g)
+                b_off += B
 
-        # f_data = 0.5 * ||r||^2   (chunked dot via arena)
-        f_data = 0.5 * float(dot_chunked(r, r, arena=ws.arena))
-
-        # g_data = A^H r(t)  (accumulate directly into ws.g sharded)
-        # We map frame ranges shard-by-shard; assume leading dim ~ frames.
-        b_off = 0
-        for sh,_ in ws.iter_shards():
-            B = sh.g.shape[0]
-            self.nufft.AH(r[b_off:b_off+B], out=sh.g)
-            b_off += B
-
-        # 2) Regularisers at x + t·d
-        #    Push x in-place, accumulate reg energy+grad, then pop back.
-        for sh,_ in ws.iter_shards():
-            sh.x.add_(sh.dx, alpha=float(t))
-
+        # 2) Regularization at x + t·dx (push/pop)
+        for sh, i in ws.iter_shards():
+            x, dx = ws.bind(i, "x", "dx")
+            x.add_(dx, alpha=float(t))
         f_reg = float(self.regm.energy_and_grad(ws))
+        for sh, i in ws.iter_shards():
+            x, dx = ws.bind(i, "x", "dx")
+            x.add_(dx, alpha=-float(t))
 
-        for sh,_ in ws.iter_shards():
-            sh.x.add_(sh.dx, alpha=-float(t))  # pop
-
-        # 3) total f and directional derivative
-        f_total = f_data + f_reg
-
+        # 3) g·d
         gdot = 0.0
-        for sh,_ in ws.iter_shards():
-            gdot += float(dot_chunked(sh.g, sh.dx, arena=ws.arena))
-        return f_total, float(gdot)
+        for sh, i in ws.iter_shards():
+            g, d = ws.bind(i, "g", "dx")
+            gdot += float(dot_chunked(g, d, arena=ws.arena))
+        return f_data + f_reg, float(gdot)
