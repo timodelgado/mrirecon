@@ -21,10 +21,12 @@ def get_ktraj2D_cufi(Ndth, Ndr, device = "cuda"):
     # First spoke (kx[:, 0] = linspace(...))
     kx[:, 0] = cp.linspace(-Ndr / 2, Ndr / 2 - 1, Ndr, dtype=cp.float32)
 
+    # Precompute rotation coefficients
+    c = cp.cos(ga)
+    s = cp.sin(ga)
+
     # Rotate subsequent spokes
     for i in range(1, Ndth):
-        c = cp.cos(ga)
-        s = cp.sin(ga)
         ky[:, i] = c * ky[:, i - 1] - s * kx[:, i - 1]
         kx[:, i] = s * ky[:, i - 1] + c * kx[:, i - 1]
 
