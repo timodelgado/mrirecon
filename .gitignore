@@ -214,6 +214,8 @@ __marimo__/
 *.pt
 *.pth
 *.py
+# Allow Python sources in tests directory
+!tests/**/*.py
 # Large experiment outputs
 checkpoints/
 results/
