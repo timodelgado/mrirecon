@@ -95,4 +95,6 @@ def _zoom(solver, *, t_low: float, f_low: float,
             t_low, f_low = t_mid, f_mid
 
     # give best Armijo point we had
-    return True, float(t_low), float(f_low), float(g0d)
+    # ensure gradient corresponds to the returned step, not the initial g0d
+    _, gdot_low = obj.f_g(ws, t_low)
+    return True, float(t_low), float(f_low), float(gdot_low)
