@@ -218,16 +218,31 @@ class DeviceArena:
 
     # ......................................................................
     def release(self, tensor: torch.Tensor):
-        """Return a tensor to the pool (optional; reuse also occurs on GC)."""
         key = (tensor.device, tensor.dtype)
-        sizes, bufs = self._pools[key]
-        n_elems = tensor.numel()
-        idx = bisect.bisect_left(sizes, n_elems)
-        sizes.insert(idx, n_elems)
+        sizes, stor, bufs = self._pools[key]
+        view_elems = tensor.numel()
+        storage_elems = tensor.storage().size()  # true slab
+        idx = bisect.bisect_left(sizes, view_elems)
+        sizes.insert(idx, view_elems)
+        stor.insert(idx, storage_elems)
         bufs.insert(idx, tensor)
-        self._pools[key] = self._Pool(sizes, bufs)
+        self._pools[key] = self._Pool(sizes, stor, bufs)
         self._touch[id(tensor)] = time.time()
-
+        self._maybe_evict(key)
+    def _maybe_evict(self, key):
+        if self.max_bytes is None:
+            return
+        sizes, stor, bufs = self._pools[key]
+        total_bytes = sum(se * bufs[0].element_size() for se in stor)  # all slabs' storage
+        while total_bytes > self.max_bytes and bufs:
+            # evict oldest by last‑touch
+            oldest_ix = min(range(len(bufs)), key=lambda j: self._touch.get(id(bufs[j]), 0))
+            total_bytes -= stor[oldest_ix] * bufs[oldest_ix].element_size()
+            for arr in (sizes, stor, bufs):
+                arr.pop(oldest_ix)
+        if not bufs:
+            del self._pools[key]
+        torch.cuda.empty_cache()
     # ......................................................................
     def trim(self, *, max_idle: float | None = None):
         """Drop slabs idle for longer than `max_idle` (default: self.max_idle)."""
