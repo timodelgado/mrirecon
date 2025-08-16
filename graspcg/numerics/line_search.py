@@ -1,100 +1,226 @@
 # graspcg/numerics/line_search.py
 from __future__ import annotations
-import torch
 from typing import Tuple
+import torch
+
+# This file provides a line-search that:
+#   • accepts only `solver`
+#   • internally runs begin_linesearch / end_linesearch
+#   • evaluates the objective via obj.f_g_tensor(ws, t) to keep heavy kernels compilable
+#   • returns (ok: bool, t: 0-D real tensor, f_t: 0-D real tensor, gdot_t: 0-D real tensor)
+
+# ---------------------------------------------------------------------------
+
+def _real_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype is torch.complex64:  return torch.float32
+    if dtype is torch.complex128: return torch.float64
+    return dtype
 
 @torch.no_grad()
-def search(solver, f0: float, g0d: float) -> Tuple[bool, float, float, float]:
+def search(solver) -> Tuple[bool, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Driver that dispatches to Armijo or strong Wolfe based on solver.ls_name.
-    Returns (ok, t, f(t), g(t)^T d).
-    """
-    if solver.ls_name == "armijo":
-        return _armijo(solver, f0, g0d)
-    return _wolfe(solver, f0, g0d)
+    Line-search driver (Armijo or Strong-Wolfe).
 
-# ──────────────────────────────────────────────────────────────────────
+    Returns:
+        ok      : Python bool (accepted step?)
+        t       : 0-D REAL torch tensor (on obj.y.device)
+        f_t     : 0-D REAL objective at accepted step
+        gdot_t  : 0-D REAL directional derivative at accepted step
+    """
+    ws, obj = solver.ws, solver.obj
+
+    # Defaults with graceful fallbacks
+    algo        = getattr(solver, "ls_name", "armijo").lower()
+    itmax       = int(getattr(solver, "ls_max_iter", 20))
+    c1          = float(getattr(solver, "c1", 1e-4))
+    c2          = float(getattr(solver, "c2", 0.9))
+    do_zoom     = bool(getattr(solver, "ls_zoom", True))
+    t_init      = float(getattr(solver, "t_init", getattr(solver, "ls_t0", 1.0)))
+    shrink      = float(getattr(solver, "armijo_shrink", 0.5))
+    t_growth    = float(getattr(solver, "wolfe_growth", 2.0))
+    t_max_cap   = float(getattr(solver, "t_max_cap", 1e6))
+
+    # Prepare caches for (A x) and (A d) etc. in a compile-friendly way
+    obj.begin_linesearch(ws)
+    try:
+        dtype_r = _real_dtype(obj.y.dtype)
+        dev_y   = obj.y.device
+
+        # Seed: f(0), g(0)^T d and a tensorized step t0
+        t0 = torch.zeros((), device=dev_y, dtype=dtype_r)
+        f0, g0d = obj.f_g_tensor(ws, t0)  # fills ws.g at current x
+        # If not a descent direction, reject quickly
+        if float(g0d.item()) >= 0.0:
+            return False, t0, f0, g0d
+
+        if algo.startswith("armijo"):
+            ok, t, f_t, g_t = _armijo_impl(
+                solver, f0=f0, g0d=g0d,
+                t_init=t_init, shrink=shrink, itmax=itmax, dtype_r=dtype_r, dev=dev_y
+            )
+        else:
+            ok, t, f_t, g_t = _wolfe_impl(
+                solver, f0=f0, g0d=g0d,
+                t_init=t_init, c1=c1, c2=c2, itmax=itmax, do_zoom=do_zoom,
+                growth=t_growth, t_cap=t_max_cap, dtype_r=dtype_r, dev=dev_y
+            )
+
+        return ok, t, f_t, g_t
+    finally:
+        # Always release caches (global path) even on early returns
+        obj.end_linesearch(ws)
+
+# ---------------------------------------------------------------------------
 # Armijo backtracking
-# ──────────────────────────────────────────────────────────────────────
-@torch.no_grad()
-def _armijo(solver, f0: float, g0d: float):
-    ws, obj = solver.ws, solver.obj
-    c1, itmax = solver.c1, solver.ls_max_iter
+# ---------------------------------------------------------------------------
 
-    t = 1.0
-    f_new, gdot = f0, g0d
-    for _ in range(itmax):
-        f_new, gdot = obj.f_g(ws, t)
-        if f_new <= f0 + c1 * t * g0d:
-            return True, float(t), float(f_new), float(gdot)
-        t *= 0.5
-    return False, float(t), float(f_new), float(gdot)
-
-# ──────────────────────────────────────────────────────────────────────
-# Strong Wolfe with zoom
-# ──────────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def _wolfe(solver, f0: float, g0d: float):
+def _armijo_impl(solver,
+                 *,
+                 f0: torch.Tensor,
+                 g0d: torch.Tensor,
+                 t_init: float,
+                 shrink: float,
+                 itmax: int,
+                 dtype_r: torch.dtype,
+                 dev: torch.device):
     ws, obj = solver.ws, solver.obj
-    c1, c2, itmax, do_zoom = solver.c1, solver.c2, solver.ls_max_iter, solver.ls_zoom
+
+    t_val = max(1e-12, float(t_init))
+    f_best, g_best = f0, g0d
+    t_best = torch.tensor(t_val, device=dev, dtype=dtype_r)
+
+    for _ in range(int(itmax)):
+        t = torch.tensor(t_val, device=dev, dtype=dtype_r)
+        f_t, g_t = obj.f_g_tensor(ws, t)
+
+        # Armijo: f(t) <= f(0) + c1 * t * g(0)^T d
+        rhs = f0 + float(getattr(solver, "c1", 1e-4)) * t * g0d
+        if bool((f_t <= rhs).item()):
+            return True, t, f_t, g_t
+
+        # keep last seen values in case we need to report them
+        f_best, g_best, t_best = f_t, g_t, t
+        t_val *= float(shrink)
+
+    return False, t_best, f_best, g_best
+
+# ---------------------------------------------------------------------------
+# Strong Wolfe (with optional zoom)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _wolfe_impl(solver,
+                *,
+                f0: torch.Tensor,
+                g0d: torch.Tensor,
+                t_init: float,
+                c1: float,
+                c2: float,
+                itmax: int,
+                do_zoom: bool,
+                growth: float,
+                t_cap: float,
+                dtype_r: torch.dtype,
+                dev: torch.device):
+    ws, obj = solver.ws, solver.obj
 
     t_prev = 0.0
     f_prev = f0
     g_prev = g0d
-    t = 1.0
+    t_val  = max(1e-12, float(t_init))
 
-    for i in range(itmax):
-        f_t, gdot_t = obj.f_g(ws, t)
+    for i in range(int(itmax)):
+        t = torch.tensor(t_val, device=dev, dtype=dtype_r)
+        f_t, g_t = obj.f_g_tensor(ws, t)
 
-        # Armijo violation or non‑improving -> zoom
-        if (f_t > f0 + c1 * t * g0d) or (i > 0 and f_t >= f_prev):
+        # Armijo violation or non-improvement triggers zoom/bracket handling
+        armijo_rhs = f0 + c1 * t * g0d
+        if bool((f_t > armijo_rhs).item()) or (i > 0 and bool((f_t >= f_prev).item())):
             if do_zoom:
-                return _zoom(solver, t_low=t_prev, f_low=f_prev, t_high=t,
-                             f0=f0, g0d=g0d)
-            # fallback: backtrack like Armijo
-            return _armijo(solver, f0, g0d)
+                ok, tz, fz, gz = _zoom_impl(
+                    solver, f0=f0, g0d=g0d,
+                    t_lo=t_prev, f_lo=f_prev,
+                    t_hi=t_val,  f_hi=f_t,
+                    c1=c1, c2=c2, itmax=itmax,
+                    dtype_r=dtype_r, dev=dev
+                )
+                return ok, tz, fz, gz
+            # Fallback: Armijo backtracking
+            return _armijo_impl(solver, f0=f0, g0d=g0d, t_init=min(t_val, 1.0),
+                                shrink=float(getattr(solver, "armijo_shrink", 0.5)),
+                                itmax=itmax, dtype_r=dtype_r, dev=dev)
 
-        # Curvature condition satisfied?
-        if abs(gdot_t) <= -c2 * g0d:
-            return True, float(t), float(f_t), float(gdot_t)
+        # Curvature condition |g(t)^T d| <= -c2 * g(0)^T d
+        if bool((g_t.abs() <= (-c2) * g0d).item()):
+            return True, t, f_t, g_t
 
-        # If slope positive -> zoom between t and t_prev
-        if gdot_t >= 0.0:
+        # If slope positive, zoom between (t, t_prev)
+        if bool((g_t >= 0).item()):
             if do_zoom:
-                return _zoom(solver, t_low=t, f_low=f_t, t_high=t_prev,
-                             f0=f0, g0d=g0d)
-            return True, float(t), float(f_t), float(gdot_t)
+                ok, tz, fz, gz = _zoom_impl(
+                    solver, f0=f0, g0d=g0d,
+                    t_lo=t_val, f_lo=f_t,
+                    t_hi=t_prev, f_hi=f_prev,
+                    c1=c1, c2=c2, itmax=itmax,
+                    dtype_r=dtype_r, dev=dev
+                )
+                return ok, tz, fz, gz
+            # If no zoom, accept (often good enough)
+            return True, t, f_t, g_t
 
-        # otherwise increase step and continue
-        t_prev, f_prev, g_prev = t, f_t, gdot_t
-        t = min(2.0 * t, 1e6)
+        # Otherwise, increase step and continue
+        t_prev, f_prev, g_prev = t_val, f_t, g_t
+        t_val = min(t_val * float(growth), float(t_cap))
 
-    return False, float(t_prev), float(f_prev), float(g_prev)
+    # Exhausted iterations: return the last improving bracket point
+    t_last = torch.tensor(t_prev, device=dev, dtype=dtype_r)
+    return False, t_last, f_prev, g_prev
 
 @torch.no_grad()
-def _zoom(solver, *, t_low: float, f_low: float,
-          t_high: float, f0: float, g0d: float):
+def _zoom_impl(solver,
+               *,
+               f0: torch.Tensor,
+               g0d: torch.Tensor,
+               t_lo: float,
+               f_lo: torch.Tensor,
+               t_hi: float,
+               f_hi: torch.Tensor,
+               c1: float,
+               c2: float,
+               itmax: int,
+               dtype_r: torch.dtype,
+               dev: torch.device):
     """
-    Simple bisection zoom that enforces Armijo and tries to satisfy curvature.
+    Simple bisection zoom:
+      - maintains Armijo bracket
+      - tries to satisfy strong curvature
     """
     ws, obj = solver.ws, solver.obj
-    c1, c2, itmax = solver.c1, solver.c2, solver.ls_max_iter
 
-    for _ in range(itmax):
-        t_mid = 0.5 * (t_low + t_high)
-        f_mid, gdot_mid = obj.f_g(ws, t_mid)
+    tL, fL = float(t_lo), f_lo
+    tH, fH = float(t_hi), f_hi
+    t_best, f_best, g_best = torch.tensor(tL, device=dev, dtype=dtype_r), fL, g0d
 
-        if (f_mid > f0 + c1 * t_mid * g0d) or (f_mid >= f_low):
-            t_high = t_mid
+    for _ in range(int(itmax)):
+        tm = 0.5 * (tL + tH)
+        t = torch.tensor(tm, device=dev, dtype=dtype_r)
+        f_m, g_m = obj.f_g_tensor(ws, t)
+
+        armijo_rhs = f0 + c1 * t * g0d
+        if bool((f_m > armijo_rhs).item()) or bool((f_m >= fL).item()):
+            tH, fH = tm, f_m
         else:
             # Armijo ok; check curvature
-            if abs(gdot_mid) <= -c2 * g0d:
-                return True, float(t_mid), float(f_mid), float(gdot_mid)
-            if gdot_mid * (t_high - t_low) >= 0:
-                t_high = t_low
-            t_low, f_low = t_mid, f_mid
+            if bool((g_m.abs() <= (-c2) * g0d).item()):
+                return True, t, f_m, g_m
+            if tm == tH or tm == tL:
+                # Degenerate interval; accept best Armijo point
+                return True, t, f_m, g_m
+            if bool((g_m * (tH - tL) >= 0).item()):
+                tH, fH = tL, fL
+            tL, fL = tm, f_m
+            t_best, f_best, g_best = t, f_m, g_m
 
-    # give best Armijo point we had
-    # ensure gradient corresponds to the returned step, not the initial g0d
-    _, gdot_low = obj.f_g(ws, t_low)
-    return True, float(t_low), float(f_low), float(gdot_low)
+    # Return best Armijo point we had in the zoom
+    return True, t_best, f_best, g_best

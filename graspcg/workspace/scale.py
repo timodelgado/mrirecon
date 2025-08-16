@@ -113,12 +113,6 @@ class ScaleField:
     # alias (sometimes nicer to call)
     ema_update = update_ema
 
-    @torch.no_grad()
-    def invalidate(self):
-        """Clear device caches (call if you updated internals externally)."""
-        self._cache_inv_s2.clear()
-        self._dirty = False
-
     # ------------------------- internal helpers -------------------------
     @torch.no_grad()
     def _recompute_inv_s2(self):
@@ -142,6 +136,8 @@ class ScaleField:
 
     @torch.no_grad()
     def invalidate(self):
+        """Mark device caches dirty so they get rebuilt on next use."""
         self._cache_inv_s2.clear()
         self._dirty = True
+
     
