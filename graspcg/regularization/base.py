@@ -40,9 +40,6 @@ class RegContext:
     device: torch.device
     dtype_c: torch.dtype
     dtype_r: torch.dtype
-
-    # Optional inputs (provided by the manager/workspace)
-    #       The TV kernel pads it over the temporal halo internally if needed.
     # Helpers (injected by the manager)
     axes_resolver: Optional[callable] = None      # (AxesSpec) -> Tuple[int,...]
     arena: Optional[Any] = None                   # DeviceArena or scratch provider
@@ -53,10 +50,6 @@ class RegContext:
     shard_index: Optional[int] = None
     halo_map: Optional[dict] = None
 
-    # Optional StatsBoard slots for on-device histogramming
-    hist_edges: Optional[torch.Tensor] = None     # (nbins+1,) float32
-    hist_counts: Optional[torch.Tensor] = None    # (nbins,)   int64
-    hist_enabled: Optional[torch.Tensor] = None   # 0-d int64 {0,1}
 
 class Regularizer(Protocol):
     """

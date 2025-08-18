@@ -12,39 +12,7 @@ from ..ops.ndops import (  # compile‑friendly TV stencils
     tv_iso_div,  tv_iso_flux,  tv_iso_energy,
 )
 
-# --------------------------- helpers ---------------------------
 
-def _resolve_axes_local(spec: AxesSpec, roles: Roles) -> Tuple[int, ...]:
-    u, l, n = int(roles.unlike), int(roles.like), int(roles.nufft)
-    total = u + l + n
-    def rng(s, c): return list(range(s, s+c))
-    tok = {
-        "temporal": rng(0, u), "time": rng(0, u), "unlike": rng(0, u),
-        "like": rng(u, l),
-        "spatial": rng(u+l, n), "nufft": rng(u+l, n), "image": rng(u+l, n),
-    }
-    out: List[int] = []
-    if isinstance(spec, str):
-        out.extend(tok.get(spec.lower(), []))
-    elif isinstance(spec, (list, tuple)):
-        for s in spec:
-            if isinstance(s, str):
-                out.extend(tok.get(s.lower(), []))
-            elif isinstance(s, int):
-                ax = s if s >= 0 else (total + s)
-                if ax < 0 or ax >= total:
-                    raise ValueError(f"Axis index {s} out of range for dims={total}")
-                out.append(ax)
-            else:
-                raise TypeError(f"Bad axis element: {type(s)}")
-    else:
-        raise TypeError(f"Bad axes spec type: {type(spec)}")
-    # dedup preserve order
-    seen, uniq = set(), []
-    for a in out:
-        if a not in seen:
-            seen.add(a); uniq.append(a)
-    return tuple(uniq)
 
 # --------------------------- params ---------------------------
 
@@ -149,7 +117,7 @@ class TVND(Regularizer):
     def halo(self, roles: Roles) -> Mapping[int, int]:
         # request 1‑sample halo along temporal (absolute axis 0) if included
         h = {}
-        axes = self._resolve_axes_local(self.params.axes, roles)
+        axes = roles.resolve_axes(self.params.axes)
         if any(ax == 0 for ax in axes):
             h[0] = 1
         return h
@@ -157,8 +125,6 @@ class TVND(Regularizer):
     def _resolve_axes(self, ctx: RegContext) -> Tuple[int, ...]:
         if getattr(ctx, "axes_resolver", None) is not None:
             return tuple(int(a) for a in ctx.axes_resolver(self.params.axes))
-        return self._resolve_axes_local(self.params.axes, ctx.roles_image)
+        return ctx.roles_image.resolve_axes(self.params.axes)
 
-    @staticmethod
-    def _resolve_axes_local(spec: AxesSpec, roles: Roles) -> Tuple[int, ...]:
-        return _resolve_axes_local(spec, roles)
+

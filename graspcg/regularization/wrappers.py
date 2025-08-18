@@ -1,48 +1,65 @@
 # graspcg/regularization/wrappers.py
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 import torch
 from .base import Regularizer, RegContext
-from ..ops.opchain import LinOp
+from .mapping import MappedRegularizer, LinOpAdapter, Op
 
 @dataclass
 class Transformed(Regularizer):
-    """Wrap any Regularizer to act on u = op.fwd(z) and pull back grad with op.adj."""
+    """
+    Wrap a Regularizer with a mapping:
+      • If 'op' implements the unified Op API (forward_apply/adjoint_apply), we use it directly.
+      • Else, if 'op' provides .fwd(x)->y and .adj(y)->x, we adapt it via LinOpAdapter.
+    """
     base: Regularizer
-    op: LinOp
-    name: str  # expose a unique name for manager/policy
-    params: any  # forward base.params for policy/printing if desired
+    op: Any                    # Op or object with fwd/adj
+    name: str
+    params: Any                # optional passthrough of base.params for policies
+    _mr: MappedRegularizer = field(init=False)
+
+    def __post_init__(self):
+        # Unified mapping first
+        if hasattr(self.op, "forward_apply") and hasattr(self.op, "adjoint_apply"):
+            op_u = self.op  # already a unified Op
+        else:
+            # Legacy fwd/adj -> wrap
+            op_u = LinOpAdapter(self.op)
+        self._mr = MappedRegularizer(name=self.name, inner=self.base, op=op_u)
 
     def halo(self, roles):
-        # combine base halo with op halo
-        h1 = self.base.halo(roles)
-        h2 = self.op.halo(roles)
-        return {ax: max(h1.get(ax, 0), h2.get(ax, 0))}
+        try:
+            return self._mr.halo(roles)
+        except Exception:
+            return {}
 
     def energy_grad(self, ctx: RegContext) -> torch.Tensor:
-        # u = Phi(z), build a temp grad buffer shaped like u
-        u = self.op.fwd(ctx.x)
-        g_u = torch.zeros_like(u)  # temp grad target
+        return self._mr.energy_grad(ctx)
 
-        # Make a shallow context for the base reg: writes to g_u, reads u
-        sub = RegContext(
-            x=u, g=g_u, diag=None,
-            roles_image=ctx.roles_image, device=ctx.device,
-            dtype_c=ctx.dtype_c, dtype_r=ctx.dtype_r,
-            scale_field_shard=None, axes_resolver=ctx.axes_resolver,
-            arena=ctx.arena, write_interior_slice=ctx.write_interior_slice
-        )
-        E = self.base.energy_grad(sub)
-
-        # Pull back: g_z += (D Phi)^* g_u
-        ctx.g.add_(self.op.adj(g_u))
-        return E
-
-    # Pass-throughs (optional implementations)
+    # Optional pass-throughs
     def add_diag(self, ctx: RegContext) -> None:
-        # conservative: skip, or approximate via op energy; identity by default
-        return
-    def continuation_update(self, stats): return False
-    def scaling_policy(self, ctx): return None
-    def prox_inplace(self, ctx, step: float): pass
-    def majorizer_diag(self, ctx): return None
+        try:
+            return self._mr.add_diag(ctx)
+        except Exception:
+            return None
+
+
+
+    def continuation_update(self, stats):
+        try:
+            return bool(self.base.continuation_update(stats))
+        except Exception:
+            return False
+
+    def scaling_policy(self, ctx):  # deprecated in unified mapping
+        return None
+
+    def prox_inplace(self, ctx, step: float):
+        pass
+
+    def majorizer_diag(self, ctx):
+        try:
+            return self.base.majorizer_diag(ctx)
+        except Exception:
+            return None

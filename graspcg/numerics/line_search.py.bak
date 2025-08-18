@@ -20,16 +20,14 @@ def search(solver) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tens
 @torch.no_grad()
 def _armijo(solver):
     ws, obj = solver.ws, solver.obj
-    c1 = torch.tensor(getattr(solver, "c1", 1e-4), device=ws.primary_device, dtype = ws.dtype_r if hasattr(ws, 'dtype_r') else solver.y.real.dtype)
+    c1 = torch.tensor(getattr(solver, "c1", 1e-4), device=ws.primary_device(), dtype=ws.dtype_r)
 
     obj.begin_linesearch(ws)
     try:
         # t, f0, g0d are 0‑D REAL tensors
-        t = torch.ones((), device=ws.primary_device, dtype = ws.dtype_r if hasattr(ws, 'dtype_r') else solver.y.real.dtype)
+        t = torch.ones((), device=ws.primary_device(), dtype=ws.dtype_r)
         f0, g0d = obj.f_g_tensor(ws, torch.zeros_like(t))   # fills g at x
-        # record slope at t=0 for history
-        try: solver._ls_last_g0d = g0d
-        except Exception: pass
+
         # if descent is not valid, bail out with t=0 (no step)
         if (g0d >= 0).logical_or(torch.isnan(g0d)).logical_or(torch.isinf(g0d)):
             return torch.zeros((), device=t.device, dtype=t.dtype), t*0, f0, g0d
@@ -53,8 +51,8 @@ def _armijo(solver):
 @torch.no_grad()
 def _wolfe(solver):
     ws, obj = solver.ws, solver.obj
-    dev = ws.primary_device if hasattr(ws, 'primary_device') else solver.y.device
-    dtype = ws.dtype_r if hasattr(ws, 'dtype_r') else solver.y.real.dtype
+    dev = ws.primary_device()
+    dtype = ws.dtype_r
 
     c1 = torch.tensor(getattr(solver, "c1", 1e-4), device=dev, dtype=dtype)
     c2 = torch.tensor(getattr(solver, "c2", 0.9),  device=dev, dtype=dtype)
@@ -105,8 +103,7 @@ def _wolfe(solver):
 def _zoom(solver, *, t_low: torch.Tensor, f_low: torch.Tensor,
           t_high: torch.Tensor, f0: torch.Tensor, g0d: torch.Tensor):
     ws, obj = solver.ws, solver.obj
-    dev = ws.primary_device if hasattr(ws, 'primary_device') else solver.y.device
-    dtype = ws.dtype_r if hasattr(ws, 'dtype_r') else solver.y.real.dtype
+    dev, dtype = ws.primary_device(), ws.dtype_r
     c1 = torch.tensor(getattr(solver, "c1", 1e-4), device=dev, dtype=dtype)
     c2 = torch.tensor(getattr(solver, "c2", 0.9),  device=dev, dtype=dtype)
     itmax = int(getattr(solver, "ls_max_iter", 20))

@@ -8,7 +8,7 @@ import contextlib
 import torch
 
 from .base import Regularizer, RegParams, RegContext, AxesSpec
-from ..core.roles import resolve_axes, Roles
+from ..core.roles import Roles
 
 # For TV percentile summaries (scalar-only stats path)
 from ..ops.ndops import fwd_diff, tv_iso_energy, tv_aniso_energy
@@ -42,17 +42,17 @@ class RegManager:
         ctx.scale_field_shard is set to (B_loc,1,...,1) containing 1/s.
       - Regularizers decide how to apply 1/s (e.g., exact TV(x/s) + chain rule).
     """
-
     def __init__(self,
                  regs: Sequence[Regularizer],
                  *,
                  compile_kernels: bool = True):
         self._regs: List[Regularizer] = list(regs)
         self._compile_kernels = bool(compile_kernels)
-        self._local_registry: Dict[str, Type[Regularizer]] = {}   # kind -> class
+        # registry of regularizer classes (kind -> class)
+        self._local_registry: Dict[str, Type[Regularizer]] = {}
+        # cache of compiled/eager kernels keyed by (type, axes, device, dtypes)
         self._kernel_cache: Dict[Tuple[Any, ...], Callable[[RegContext], torch.Tensor]] = {}
-        mgr._local_registry[k] = v
-        return mgr
+        
 
     # ---------------- Main API (used by Objective/Precond/Solver) ----------------
 
@@ -174,7 +174,7 @@ class RegManager:
         if sb is not None:
             sb.scalar_slot("E_reg_total", primary, dtype_r).add_(total)
     
-        return total@torch.no_grad()
+        return total
     def add_diag(self, ws) -> None:
         """
         Invoke each regularizer's add_diag per shard with a minimal context.
@@ -230,17 +230,17 @@ class RegManager:
             axes_resolver=lambda spec: self._resolve_axes(spec, roles_image),
             arena=arena, write_interior_slice=write_interior_slice,
         )
-    def _num_shards(ws) -> int:
-            n = getattr(ws, "num_shards", None)
-            if n is not None:
-                return int(n)
-            plan = getattr(ws, "plan", None)
-            if plan is not None and hasattr(plan, "num_shards"):
-                return int(plan.num_shards)  # type: ignore[attr-defined]
-            return sum(1 for _ in ws.iter_shards())
+    def _num_shards(self, ws) -> int:
+        n = getattr(ws, "num_shards", None)
+        if n is not None:
+            return int(n)
+        plan = getattr(ws, "plan", None)
+        if plan is not None and hasattr(plan, "num_shards"):
+            return int(plan.num_shards)  # type: ignore[attr-defined]
+        return sum(1 for _ in ws.iter_shards())
 
     def _resolve_axes(self, spec: AxesSpec, roles: Roles) -> Tuple[int, ...]:
-        return resolve_axes(spec, roles)
+        return roles.resolve_axes(spec)
 
     def _aggregate_halo(self, roles: Roles) -> Dict[int, int]:
         merged: Dict[int, int] = {}

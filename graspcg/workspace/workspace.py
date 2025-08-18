@@ -4,16 +4,15 @@ import math
 import time
 import contextlib
 from dataclasses import dataclass, field
-from typing import Optional, Iterator, Tuple, List, Dict, Literal, Sequence, Any
+from typing import Optional, Iterator, Tuple, List, Dict, Literal, Sequence, Any, Protocol
 from collections import defaultdict
 
 import torch
-try:
-    import psutil  # optional; used to estimate CPU RAM if needed
-except Exception:
-    psutil = None  # type: ignore
+
+import psutil  # optional; used to estimate CPU RAM if needed
 
 from .unified_arena import DeviceArena
+from ..core.roles import Roles
 
 
 # ==============================
@@ -60,26 +59,6 @@ class BufSpec:
 
 
 # ==============================
-# Domain role descriptors
-# ==============================
-@dataclass(frozen=True)
-class Roles:
-    """
-    Number of axes in each category for a given domain.
-    Tensors must be ordered (unlike, like, nufft).
-    Example (2D multi-slice, k-space): unlike=1 (frames), like=2 (coils,z), nufft=2 (views,readout)
-             (2D multi-slice, image): unlike=1 (frames), like=1 (z),       nufft=2 (x,y)
-    """
-    unlike: int
-    like:   int
-    nufft:  int
-
-    @property
-    def ndim(self) -> int:
-        return int(self.unlike + self.like + self.nufft)
-
-
-# ==============================
 # Shards & planning
 # ==============================
 @dataclass
@@ -97,6 +76,23 @@ class Shard:
     def shape(self) -> Tuple[int, ...]:
         return (self.span,) + self.image_shape[1:]
 
+# ------------------------------
+# Abstract operator contract
+# ------------------------------
+class NUFFTLike(Protocol):
+    def A(self, x: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor: ...
+    def AH(self, y: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor: ...
+    # Provide at least one of these so Workspace can infer shapes without executing kernels:
+    def domain_shape(self) -> Tuple[int, ...]: ...
+    def image_shape(self, y: torch.Tensor) -> Tuple[int, ...]: ...
+    # North‑Star: roles MUST be provided by the operator or supplied by the caller.
+    # Preferred as attributes:
+    #   roles_image: Roles
+    #   roles_kspace: Roles
+    # Accepted as methods:
+    #   def get_roles_image(self) -> Roles: ...
+    #   def get_roles_kspace(self) -> Roles: ...
+
 
 @dataclass
 class WorkspacePlan:
@@ -110,8 +106,8 @@ class WorkspacePlan:
     tpf_by_device: Dict[int, float] = field(default_factory=dict)  # seconds per frame per device
     b_by_device  : Dict[int, int]   = field(default_factory=dict)  # frames assigned per device
     # roles (axis counts; tensors must be ordered (unlike, like, nufft))
-    roles_image: Roles = field(default_factory=lambda: Roles(unlike=1, like=0, nufft=2))
-    roles_kspace: Roles = field(default_factory=lambda: Roles(unlike=1, like=0, nufft=2))
+    roles_image: Roles = field(default_factory=lambda: Roles(unlike=1, like=1, nufft=2))
+    roles_kspace: Roles = field(default_factory=lambda: Roles(unlike=1, like=1, nufft=2))
 
 
 # ==============================
@@ -129,10 +125,9 @@ class Workspace:
     must use ws.get("name", shard_idx) to access their buffers.
     """
 
-    # ---------- construction ----------
     def __init__(self,
                  y: torch.Tensor,
-                 nufft_op: Any,
+                 nufft_op: NUFFTLike,
                  arena: DeviceArena,
                  *,
                  buf_specs: Sequence[BufSpec],
@@ -140,6 +135,8 @@ class Workspace:
                  dtype_c: torch.dtype = torch.complex64,
                  dtype_r: torch.dtype = torch.float32,
                  kspace_mode: Literal["sharded", "global"] = "sharded",
+                 roles_image: Optional[Roles] = None,
+                 roles_kspace: Optional[Roles] = None,
                  headroom: float = 0.20,
                  benchmark: bool = True,
                  bench_frames: int = 2,
@@ -164,6 +161,8 @@ class Workspace:
             image_shape=image_shape,
             dtype_c=dtype_c, dtype_r=dtype_r,
             kspace_mode=kspace_mode,
+            roles_image=roles_image,
+            roles_kspace=roles_kspace,
             headroom=headroom,
             benchmark=benchmark,
             bench_frames=bench_frames,
@@ -191,7 +190,7 @@ class Workspace:
     # ---------- planning ----------
     @staticmethod
     @torch.no_grad()
-    def _infer_image_shape(nufft_op, y: torch.Tensor,
+    def _infer_image_shape(nufft_op: NUFFTLike, y: torch.Tensor,
                            *, dtype_c=torch.complex64) -> Tuple[int, ...]:
         # Prefer operator hints
         if hasattr(nufft_op, "image_shape") and callable(getattr(nufft_op, "image_shape")):
@@ -204,10 +203,48 @@ class Workspace:
                 shp = tuple(int(s) for s in shp)
                 return shp if len(shp) == len(y.shape) else (int(y.shape[0]),) + shp
 
-        # Fallback: probe one frame with AH
+        # Fallback: probe one frame with AH only if supported without a required 'out'
         y0 = y[:1]
-        x0 = nufft_op.AH(y0)
+        try:
+            x0 = nufft_op.AH(y0)  # may allocate and return
+        except TypeError as e:
+            raise RuntimeError(
+                "Operator must implement either domain_shape(), image_shape(y), "
+                "or AH(y) without a required 'out' argument to allow shape inference."
+            ) from e
         return (int(y.shape[0]),) + tuple(int(s) for s in x0.shape[1:])
+
+    # ---------- roles resolution (no inference) ----------
+    @staticmethod
+    def _maybe_roles(obj: Any) -> Optional[Roles]:
+        if isinstance(obj, Roles):
+            return obj
+        if isinstance(obj, (tuple, list)) and len(obj) == 3:
+            try:
+                u, l, n = (int(obj[0]), int(obj[1]), int(obj[2]))
+                return Roles(unlike=u, like=l, nufft=n)
+            except Exception:
+                return None
+        return None
+
+    @classmethod
+    def _roles_from_operator(cls, nufft_op: Any) -> tuple[Optional[Roles], Optional[Roles]]:
+        ri = cls._maybe_roles(getattr(nufft_op, "roles_image", None))
+        rk = cls._maybe_roles(getattr(nufft_op, "roles_kspace", None))
+        if ri is None:
+            fn = getattr(nufft_op, "get_roles_image", None)
+            if callable(fn):
+                ri = cls._maybe_roles(fn())
+        if rk is None:
+            fn = getattr(nufft_op, "get_roles_kspace", None)
+            if callable(fn):
+                rk = cls._maybe_roles(fn())
+        # Single 'roles' fallback (applies to both if present)
+        if ri is None:
+            ri = cls._maybe_roles(getattr(nufft_op, "roles", None))
+        if rk is None:
+            rk = cls._maybe_roles(getattr(nufft_op, "roles", None))
+        return ri, rk
 
     @staticmethod
     def _elem_size(dt: torch.dtype) -> int:
@@ -270,7 +307,7 @@ class Workspace:
     @classmethod
     @torch.no_grad()
     def _bench_tpf(
-        cls, nufft_op, image_shape: Tuple[int, ...], kspace_shape: Tuple[int, ...],
+        cls, nufft_op: NUFFTLike, image_shape: Tuple[int, ...], kspace_shape: Tuple[int, ...],
         device: torch.device, dtype_c: torch.dtype, dtype_k: torch.dtype,
         frames: int = 2
     ) -> float:
@@ -390,7 +427,7 @@ class Workspace:
     @classmethod
     def infer_plan(
         cls,
-        nufft_op: Any,
+        nufft_op: NUFFTLike,
         y: torch.Tensor,
         arena: DeviceArena,
         specs: Sequence[BufSpec],
@@ -399,6 +436,8 @@ class Workspace:
         dtype_c: torch.dtype = torch.complex64,
         dtype_r: torch.dtype = torch.float32,
         kspace_mode: Literal["sharded", "global"] = "sharded",
+        roles_image: Optional[Roles] = None,
+        roles_kspace: Optional[Roles] = None,
         headroom: float = 0.20,
         benchmark: bool = True,
         bench_frames: int = 2,
@@ -410,42 +449,17 @@ class Workspace:
         img_shape = image_shape or cls._infer_image_shape(nufft_op, y, dtype_c=dtype_c)
         k_shape   = tuple(int(s) for s in y.shape)
 
-        # ---- Fetch roles from NUFFT and validate canonical order -----------
-        def _coerce_roles(obj, default: Roles) -> Roles:
-            if isinstance(obj, Roles): return obj
-            if isinstance(obj, (tuple, list)) and len(obj) == 3:
-                return Roles(int(obj[0]), int(obj[1]), int(obj[2]))
-            if isinstance(obj, dict):
-                return Roles(int(obj.get("unlike", default.unlike)),
-                             int(obj.get("like",   default.like)),
-                             int(obj.get("nufft",  default.nufft)))
-            return default
-
-        def _roles_from_nufft(op) -> Tuple[Roles, Roles]:
-            img, ksp = getattr(op, "roles_image", None), getattr(op, "roles_kspace", None)
-            if img is None or ksp is None:
-                roles_fn = getattr(op, "roles", None)
-                if callable(roles_fn):
-                    out = roles_fn()
-                    if isinstance(out, dict):
-                        img = out.get("image", img); ksp = out.get("kspace", ksp)
-                    elif isinstance(out, (tuple, list)) and len(out) == 2:
-                        img, ksp = out
-            default_img = Roles(unlike=1, like=0, nufft=2)
-            default_ksp = Roles(unlike=1, like=0, nufft=2)
-            return _coerce_roles(img, default_img), _coerce_roles(ksp, default_ksp)
-
-        roles_image, roles_kspace = _roles_from_nufft(nufft_op)
-
-        def _check_roles(shape: Tuple[int, ...], roles: Roles, domain: str):
-            if len(shape) != roles.ndim:
-                raise ValueError(
-                    f"{domain} shape {shape} has {len(shape)} dims but roles specify {roles.ndim} "
-                    f"(unlike={roles.unlike}, like={roles.like}, nufft={roles.nufft}). "
-                    "Expected tensors ordered as (unlike, like, nufft)."
-                )
-        _check_roles(img_shape, roles_image,  "image")
-        _check_roles(k_shape,   roles_kspace, "k-space")
+        # ── Resolve roles (no inference/normalization) ─────────────────────────────
+        if (roles_image is None) or (roles_kspace is None):
+            ri, rk = cls._roles_from_operator(nufft_op)
+            if roles_image is None:  roles_image = ri
+            if roles_kspace is None: roles_kspace = rk
+        if (roles_image is None) or (roles_kspace is None):
+            raise ValueError(
+                "Workspace requires explicit axis roles. "
+                "Provide roles_image/roles_kspace in Workspace(...), or define them on the operator as "
+                "attributes 'roles_image'/'roles_kspace' (or accessors 'get_roles_image'/'get_roles_kspace')."
+            )
 
         # Memory model (peak) derived from manifest
         bytes_per_frame, const_bytes, kspace_bytes_pf = cls._bytes_per_frame_and_const(specs, img_shape, k_shape)
@@ -612,3 +626,8 @@ class Workspace:
         if not isinstance(obj, list):
             return obj
         return torch.cat(obj, dim=0)
+
+    @property
+    def primary_device(self) -> torch.device:
+        # First shard device if available; otherwise align with y
+        return self.plan.shards[0].device if self.plan.shards else self.y.device

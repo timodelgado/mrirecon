@@ -183,8 +183,8 @@ class Objective:
                     t_dev = t.to(dev, dtype=dtype_r)
 
                     # residual + energy (compiled)
-                    e = self._ker_residual_energy(r, Ax, Ad, y_slice, t_dev)  # 0‑D real on dev
-
+                    e = self._ker_residual_energy(r, self._Ax, self._Adx, self.y, t_dev)
+                    f_data = e.mul(0.5)
                     # device accum
                     if dev in f_data_dev:
                         f_data_dev[dev].add_(e)
@@ -198,7 +198,7 @@ class Objective:
                     b_off += B
 
             # reduce to a primary device
-            f_data = self._reduce0d(f_data_dev, prefer_device=self.y.device, dtype=dtype_r)
+            f_data = self._reduce0d(f_data_dev, prefer_device=ws.primary_device, dtype=dtype_r)
             f_data.mul_(0.5)
             ws.stats.scalar_slot("E_data", f_data.device, f_data.dtype).add_(f_data)
         else:
@@ -247,7 +247,7 @@ class Objective:
                 gdot_dev[dev].add_(gd)
             else:
                 gdot_dev[dev] = gd
-        gdot = self._reduce0d(gdot_dev, prefer_device=self.y.device, dtype=dtype_r)
+        gdot = self._reduce0d(gdot_dev, prefer_device=ws.primary_device, dtype=dtype_r)
         ws.stats.scalar_slot("gdot", gdot.device, gdot.dtype).add_(gdot)
 
         # --- 4) Total objective and return (keep tensors, no .item() here)

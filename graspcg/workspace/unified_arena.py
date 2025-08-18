@@ -91,14 +91,56 @@ class DeviceArena:
     # ----------------------------------------------------------------- config
     def compute_device(self) -> torch.device:
         """Return primary compute device (alias: torch_device)."""
-        d = self.compute
-        if d == "cpu":
-            return torch.device("cpu")
-        if d in ("cuda", "gpu"):
-            return torch.device("cuda", torch.cuda.current_device())
-        if isinstance(d, str) and d.startswith("cuda"):
-            return torch.device(d)
-        return torch.device("cuda", int(d))
+        d = getattr(self, "compute", None)
+
+        # Already a torch.device
+        if isinstance(d, torch.device):
+            return d
+
+        # Integer index -> cuda:{index}
+        if isinstance(d, int):
+            return torch.device("cuda", d)
+
+        # String specs
+        if isinstance(d, str):
+            ds = d.lower()
+
+            if ds == "cpu":
+                return torch.device("cpu")
+
+            if ds in ("cuda", "gpu"):
+                if torch.cuda.is_available():
+                    return torch.device("cuda", torch.cuda.current_device())
+                # Safer fallback if CUDA is not available
+                return torch.device("cpu")
+
+            # "cuda:0", "cuda:1"
+            if ds.startswith("cuda:"):
+                try:
+                    return torch.device(ds)
+                except Exception:
+                    # Safer fallback
+                    return torch.device("cpu")
+
+            # "cuda0", "cuda1"
+            if ds.startswith("cuda"):
+                digits = "".join(ch for ch in ds if ch.isdigit())
+                if digits:
+                    idx = int(digits)
+                    return torch.device("cuda", idx)
+                if torch.cuda.is_available():
+                    return torch.device("cuda", torch.cuda.current_device())
+                return torch.device("cpu")
+
+            # numeric string -> cuda:{index}
+            try:
+                idx = int(ds)
+                return torch.device("cuda", idx)
+            except Exception:
+                return torch.device("cpu")
+
+        # None or unknown type -> default CPU
+        return torch.device("cpu")
 
     # legacy alias
     torch_device = compute_device
@@ -268,6 +310,9 @@ class DeviceArena:
             del self._pools[key]
         torch.cuda.empty_cache()
 
-
-# Backwards compatibility: allow importing the old name
+    # very small alias for older call-sites; keep until the next minor
+    def primary_device(self) -> torch.device:
+        return self.compute_device()
+    
+# Backwards compatibility (to be removed in a future minor): allow importing the old name
 UnifiedArena = DeviceArena
