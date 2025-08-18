@@ -1,0 +1,144 @@
+# graspcg/regularization/reg_maps.py
+from __future__ import annotations
+from typing import Protocol, Tuple, Dict, Optional, Sequence, List
+import torch
+from ..core.roles import Roles
+
+class RegMap(Protocol):
+    """
+    Mapping from solver variable (x_base) to regularizer input u, with adjoint pullback.
+
+    forward(ctx, x_ext, interior) -> u_ext
+      - x_ext: halo-extended read tensor from workspace (shape like ws.x shard, maybe with halo).
+      - return u_ext, same batch/halo semantics; can change inner-axis lengths.
+    pullback(ctx, g_u_interior, out_g, interior) -> None
+      - Accumulate gradient wrt base variable into out_g[interior].
+    Optional helpers:
+      - roles_for_u(roles): if mapping changes semantic axis categories; default is identity.
+      - halo_extra(roles, axes): if the map needs extra halo; default is none.
+    """
+    def forward(self, ctx, x_ext: torch.Tensor, interior: Tuple[slice, ...]) -> torch.Tensor: ...
+    def pullback(self, ctx, g_u_interior: torch.Tensor, out_g: torch.Tensor,
+                 interior: Tuple[slice, ...]) -> None: ...
+    def roles_for_u(self, roles: Roles) -> Roles: return roles
+    def halo_extra(self, roles: Roles, axes: Tuple[int, ...]) -> Dict[int, int]: return {}
+
+# -------------------- Identity --------------------
+
+class IdentityMap:
+    def forward(self, ctx, x_ext: torch.Tensor, interior: Tuple[slice, ...]) -> torch.Tensor:
+        return x_ext
+    def pullback(self, ctx, g_u_interior: torch.Tensor, out_g: torch.Tensor,
+                 interior: Tuple[slice, ...]) -> None:
+        out_g[interior].add_(g_u_interior)
+
+# -------------------- Scale (uses ctx.scale_field_shard as 1/s) --------------------
+
+class ScaleMap:
+    """
+    Uses the per-shard (1/s) already provided by the manager via ctx.scale_field_shard.
+    Extends (1/s) across halo along the sharded batch axis and applies chain rule.
+    """
+    def forward(self, ctx, x_ext: torch.Tensor, interior: Tuple[slice, ...]) -> torch.Tensor:
+        dev = x_ext.device
+        dr  = x_ext.real.dtype
+        s_int = ctx.scale_field_shard  # (B_loc,1,...,1)
+        if s_int is None:
+            return x_ext
+        # Build s_ext (match halo along batch dimension)
+        B_ext = int(x_ext.shape[0])
+        start = int(interior[0].start or 0)
+        stop  = int(interior[0].stop  or B_ext)
+        left  = start
+        right = B_ext - stop
+        if left > 0 or right > 0:
+            s_ext = torch.cat([
+                s_int[0:1].expand(left,  *s_int.shape[1:]),
+                s_int,
+                s_int[-1:].expand(right, *s_int.shape[1:]),
+            ], dim=0)
+        else:
+            s_ext = s_int
+        return x_ext * s_ext
+
+    def pullback(self, ctx, g_u_interior: torch.Tensor, out_g: torch.Tensor,
+                 interior: Tuple[slice, ...]) -> None:
+        s_int = ctx.scale_field_shard
+        if s_int is None:
+            out_g[interior].add_(g_u_interior)
+        else:
+            out_g[interior].add_(g_u_interior * s_int)
+
+# -------------------- TemporalBasis: u = U @ v  along an inner axis --------------------
+
+class TemporalBasisMap:
+    """
+    Let v have an inner axis of length R (coeffs). Produce frames u with length T via U (T x R).
+    inner_axis: index among *inner* dims (exclude batch at dim 0). For example, if v has
+      shape (B, R, H, W), inner_axis=0 maps that R axis. If (B, H, W, R), inner_axis=2.
+    """
+    def __init__(self, U: torch.Tensor, inner_axis: int):
+        # U has shape (T, R); real or complex OK (will promote with v)
+        assert U.ndim == 2, "U must be (T,R)"
+        self.U_cpu = U.detach().cpu()
+        self.inner_axis = int(inner_axis)
+        self._cache: Dict[torch.device, torch.Tensor] = {}
+
+    def _U(self, dev: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        U = self._cache.get(dev)
+        if U is None or U.dtype != dtype:
+            U = self.U_cpu.to(device=dev, dtype=dtype, non_blocking=True)
+            self._cache[dev] = U
+        return U
+
+    def forward(self, ctx, x_ext: torch.Tensor, interior: Tuple[slice, ...]) -> torch.Tensor:
+        # move mapped axis to last, contract with U^T or U?
+        # We want u[..., T] = tensordot(x[..., R], U, ([last],[1])) => result last dim T.
+        dev = x_ext.device
+        dtype = x_ext.dtype
+        ax_abs = 1 + self.inner_axis  # skip batch dim
+        v_perm = x_ext.movedim(ax_abs, -1)   # (..., R)
+        U = self._U(dev, dtype.real)         # (T, R) real/float; matmul promotes as needed
+        u_perm = torch.tensordot(v_perm, U.t(), dims=([-1], [-1]))  # (..., T)
+        u_ext  = u_perm.movedim(-1, ax_abs)  # back to (... with T at ax_abs)
+        return u_ext
+
+    def pullback(self, ctx, g_u_interior: torch.Tensor, out_g: torch.Tensor,
+                 interior: Tuple[slice, ...]) -> None:
+        dev = g_u_interior.device
+        # Bring T-ax to last, multiply by U (R x T) to get gradients in coeff space
+        ax_abs = 1 + self.inner_axis
+        gu_perm = g_u_interior.movedim(ax_abs, -1)  # (..., T)
+        U = self._U(dev, g_u_interior.real.dtype).t().conj()  # (R, T)
+        gv_perm = torch.tensordot(gu_perm, U.t(), dims=([-1], [-1]))  # (..., R)
+        gv = gv_perm.movedim(-1, ax_abs)
+        out_g[interior].add_(gv)
+
+# -------------------- Compose maps --------------------
+
+class ComposeMap:
+    """Compose multiple maps: forward left->right, pullback right->left (adjoints)."""
+    def __init__(self, ops: Sequence[RegMap]):
+        self.ops: List[RegMap] = list(ops)
+    def forward(self, ctx, x_ext: torch.Tensor, interior: Tuple[slice, ...]) -> torch.Tensor:
+        u = x_ext
+        for op in self.ops:
+            u = op.forward(ctx, u, interior)
+        return u
+    def pullback(self, ctx, g_u_interior: torch.Tensor, out_g: torch.Tensor,
+                 interior: Tuple[slice, ...]) -> None:
+        # accumulate through the chain of adjoints
+        grad = g_u_interior
+        # We need to apply each op's pullback into an intermediate buffer; to avoid
+        # allocations, let each op write into out_g and then reuse grad=inplace view.
+        # Simpler: cascade using a small lambda that captures a temp tensor.
+        tmp: Optional[torch.Tensor] = None
+        for op in reversed(self.ops):
+            # allocate tmp lazily with the same device/dtype as out_g[interior]
+            if tmp is None:
+                tmp = torch.zeros_like(out_g[interior])
+            tmp.zero_()
+            # op pulls back into tmp (as if tmp were out_g[interior])
+            op.pullback(ctx, grad, tmp, slice(None))  # slice(None) stands for exact shape
+            grad = tmp
+        out_g[interior].add_(grad)

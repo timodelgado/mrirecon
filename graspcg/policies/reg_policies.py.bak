@@ -1,0 +1,252 @@
+# graspcg/policies/reg_policy.py
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import Optional, Sequence
+
+import torch
+
+# Regularizer type for ε updates (identify TV regs)
+from ..regularization.tv_nd import TVND
+
+
+# ---------------------------
+# Configuration
+# ---------------------------
+@dataclass
+class RegPolicyConfig:
+    # ----- ε (TV smoothing) from quantile -----
+    enable_eps_from_percentile: bool = True
+    eps_percentile: float = 0.90         # p-quantile to target
+    eps_floor: float = 1e-6              # numerical floor
+    eps_ema_alpha: float = 0.5           # EMA smoothing (0..1], 1=no smoothing
+    eps_update_every: int = 1            # apply every N policy calls
+
+    # toggle name used by the manager to know whether to compute tv quantile
+    tv_quantile_key: str = "tv_quantile"
+
+    # Fallback support for legacy (sum, n) accumulation per reg and percentile
+    # Keys formed as: f"tv/p{int(q*100)}/sum/<reg>", f"tv/p{int(q*100)}/n/<reg>"
+    support_legacy_p_sum_n: bool = True
+
+    # ----- λ (weights) from energy ratios -----
+    enable_lambda_from_energy_ratio: bool = False
+    lambda_update_every: int = 1
+
+    # Which ratio to regulate:
+    #   "reg_over_total": use E_reg_total / (E_data + E_reg_total)  vs  target_frac
+    #   "reg_over_data" : use E_reg_total / E_data                  vs  target_frac
+    lambda_ratio_mode: str = "reg_over_total"
+    lambda_target_frac: float = 0.10
+    lambda_gain: float = 0.5          # sensitivity of update (0..1 typical)
+    lambda_ema_alpha: float = 0.5     # EMA on λ when applying multiplicative updates
+    lambda_bounds: tuple[float, float] = (1e-12, 1e12)
+
+    # Per-reg alternative (set to "per_reg" to use E_reg/<name> instead of total)
+    lambda_scope: str = "global"      # "global" or "per_reg"
+
+    # Bookkeeping / behavior
+    clear_after_read: bool = True
+    verbose: bool = False
+
+
+# ---------------------------
+# Policy
+# ---------------------------
+class RegPolicy:
+    """
+    Solver-agnostic continuation/tuning policy.
+
+    Responsibilities:
+      • At 'prepare_collection', enable/disable which scalars the numeric core should emit.
+      • At 'update_from_stats', read scalar keys from StatsBoard and update TV ε and/or λ.
+
+    This class NEVER enters compiled regions. It only reads/writes Python-side configs
+    and updates regularizer dataclasses (frozen) via dataclasses.replace.
+    """
+
+    def __init__(self, cfg: Optional[RegPolicyConfig] = None):
+        self.cfg = cfg or RegPolicyConfig()
+        self._tick: int = 0
+
+    # ---------------- public API ----------------
+
+    def prepare_collection(self, ws, regm) -> None:
+        """
+        Called once per *iteration* (recommended: after an accepted step, before the next LS).
+        Enables scalar collection in the numeric core and (optionally) clears previous slots.
+        """
+        sb = getattr(ws, "stats", None)
+        if sb is None:
+            return
+
+        # Determine whether we will request tv quantiles and/or per-reg energies
+        have_tv = any(isinstance(r, TVND) for r in getattr(regm, "_regs", []))
+        need_tv_q = self.cfg.enable_eps_from_percentile and have_tv
+        need_regE = self.cfg.enable_lambda_from_energy_ratio
+
+        # Toggle on scalar paths used by the manager
+        sb.enable(self.cfg.tv_quantile_key, need_tv_q)
+        sb.enable("reg_energy", need_regE)
+
+        # Optionally clear scalars we will consume to keep per-iteration values clean
+        if self.cfg.clear_after_read:
+            if need_tv_q:
+                # new scalar form: tv_q/<reg.name>
+                for r in regm._regs:
+                    if isinstance(r, TVND):
+                        sb.reset_scalar(f"tv_q/{r.name}")
+                # legacy (sum,n) form:
+                if self.cfg.support_legacy_p_sum_n:
+                    qtag = f"p{int(round(self.cfg.eps_percentile * 100))}"
+                    for r in regm._regs:
+                        if isinstance(r, TVND):
+                            sb.reset_scalar(f"tv/{qtag}/sum/{r.name}")
+                            sb.reset_scalar(f"tv/{qtag}/n/{r.name}")
+
+            if need_regE:
+                # If updating λ, keep E_reg_total / E_reg/<name> fresh
+                sb.reset_scalar("E_reg_total")
+                for r in regm._regs:
+                    sb.reset_scalar(f"E_reg/{r.name}")
+
+            # Keeping E_data unreset here is fine; it gets overwritten each eval
+            # but if you prefer strict per-iter values only:
+            # sb.reset_scalar("E_data")
+
+    def update_from_stats(self, ws, regm) -> bool:
+        """
+        Read scalar stats and update regularizer parameters (ε, λ).
+        Return True if any changes were applied.
+        """
+        sb = getattr(ws, "stats", None)
+        if sb is None:
+            return False
+
+        self._tick += 1
+        changed = False
+
+        # --- ε updates (TVND only) ---
+        if self.cfg.enable_eps_from_percentile and (self._tick % max(1, self.cfg.eps_update_every) == 0):
+            changed |= self._update_eps_from_quantile(sb, regm)
+
+        # --- λ updates (weights) ---
+        if self.cfg.enable_lambda_from_energy_ratio and (self._tick % max(1, self.cfg.lambda_update_every) == 0):
+            changed |= self._update_lambda_from_energy(sb, regm)
+
+        return changed
+
+    # ---------------- internals ----------------
+
+    # ε ← quantile (TV magnitude), with floor and EMA
+    def _update_eps_from_quantile(self, sb, regm) -> bool:
+        changed_any = False
+        q = float(self.cfg.eps_percentile)
+        qtag = f"p{int(round(q * 100))}"
+
+        for reg in getattr(regm, "_regs", []):
+            if not isinstance(reg, TVND):
+                continue
+
+            # Preferred: a single aggregated quantile per reg
+            qv = sb.read_scalar(f"tv_q/{reg.name}")
+
+            # Fallback: average of per-shard quantiles (sum/n) if present
+            if (qv == 0.0) and self.cfg.support_legacy_p_sum_n:
+                s = sb.read_scalar(f"tv/{qtag}/sum/{reg.name}")
+                n = sb.read_scalar(f"tv/{qtag}/n/{reg.name}")
+                if n > 0.0:
+                    qv = s / n
+
+            if qv <= 0.0:
+                continue  # nothing to do
+
+            eps_old = float(getattr(reg.params, "eps", 0.0))
+            eps_est = max(qv, float(self.cfg.eps_floor))
+            eps_new = self._ema(eps_old, eps_est, self.cfg.eps_ema_alpha)
+
+            if eps_new != eps_old:
+                reg.params = replace(reg.params, eps=eps_new)
+                changed_any = True
+                if self.cfg.verbose:
+                    print(f"[policy] {reg.name}: eps {eps_old:.3e} -> {eps_new:.3e}")
+
+        return changed_any
+
+    # λ ← regulate energy ratio to a target fraction, with EMA and bounds
+    def _update_lambda_from_energy(self, sb, regm) -> bool:
+        changed_any = False
+
+        # Read data and totals
+        e_data = sb.read_scalar("E_data")
+        e_reg_total = sb.read_scalar("E_reg_total")
+
+        # Robust denom for ratios
+        tiny = 1e-20
+        denom_total = max(e_data + e_reg_total, tiny)
+
+        # Select ratio metric
+        if self.cfg.lambda_ratio_mode == "reg_over_data":
+            ratio_total = e_reg_total / max(e_data, tiny)
+        else:  # default: "reg_over_total"
+            ratio_total = e_reg_total / denom_total
+
+        target = float(self.cfg.lambda_target_frac)
+        gain = float(self.cfg.lambda_gain)
+        lo, hi = self.cfg.lambda_bounds
+
+        scope = (self.cfg.lambda_scope or "global").lower()
+
+        if scope == "per_reg":
+            # Individual regulation based on per-reg energies
+            for reg in getattr(regm, "_regs", []):
+                e_reg_i = sb.read_scalar(f"E_reg/{reg.name}")
+                if self.cfg.lambda_ratio_mode == "reg_over_data":
+                    r_i = e_reg_i / max(e_data, tiny)
+                else:
+                    r_i = e_reg_i / denom_total
+
+                scale = self._ratio_scale(r_i, target, gain)
+                lam_old = float(getattr(reg.params, "weight", 0.0))
+                lam_prop = self._clamp(lam_old * scale, lo, hi)
+                lam_new  = self._ema(lam_old, lam_prop, self.cfg.lambda_ema_alpha)
+
+                if lam_new != lam_old:
+                    reg.params = replace(reg.params, weight=lam_new)
+                    changed_any = True
+                    if self.cfg.verbose:
+                        print(f"[policy] {reg.name}: λ {lam_old:.3e} -> {lam_new:.3e} (r={r_i:.3e}, tgt={target:.3e})")
+        else:
+            # Global regulation: same scale applied to all regs
+            scale = self._ratio_scale(ratio_total, target, gain)
+            for reg in getattr(regm, "_regs", []):
+                lam_old = float(getattr(reg.params, "weight", 0.0))
+                lam_prop = self._clamp(lam_old * scale, lo, hi)
+                lam_new  = self._ema(lam_old, lam_prop, self.cfg.lambda_ema_alpha)
+
+                if lam_new != lam_old:
+                    reg.params = replace(reg.params, weight=lam_new)
+                    changed_any = True
+
+            if self.cfg.verbose and changed_any:
+                print(f"[policy] global λ scale={scale:.3e} (ratio={ratio_total:.3e}, tgt={target:.3e})")
+
+        return changed_any
+
+    @staticmethod
+    def _ema(old: float, new: float, alpha: float) -> float:
+        a = float(alpha)
+        a = 1.0 if a >= 1.0 else (0.0 if a <= 0.0 else a)
+        return (a * new) + ((1.0 - a) * old)
+
+    @staticmethod
+    def _ratio_scale(current: float, target: float, gain: float) -> float:
+        """
+        Multiplicative controller: scale = (target / max(current, tiny)) ** gain
+        """
+        tiny = 1e-20
+        return (target / max(current, tiny)) ** float(gain)
+
+    @staticmethod
+    def _clamp(x: float, lo: float, hi: float) -> float:
+        return min(max(x, lo), hi)

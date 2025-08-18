@@ -1,0 +1,118 @@
+# graspcg/regularization/mapped.py (new)
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional, Tuple, Protocol
+import torch
+from .base import Regularizer, RegContext
+
+class FieldMap(Protocol):
+    """Map from parameter tensors in ws -> field u (with halo) and pullback of grad(u)."""
+    def forward_ext(self, ws, i: int, interior: Tuple[slice, ...], halo: dict, *, anchor: torch.Tensor) -> torch.Tensor:
+        """Return u_ext on the shard device with halo applied along batch/time if needed."""
+        ...
+    def pullback_interior(self, gu_int: torch.Tensor, ws, i: int, interior: Tuple[slice, ...]) -> None:
+        """Accumulate ∂E/∂params into appropriate ws buffers from grad wrt u (restricted to interior)."""
+        ...
+
+@dataclass
+class MappedRegularizer(Regularizer):
+    """Wrap an inner regularizer to act on u = Φ(params) instead of x."""
+    name: str
+    inner: Regularizer
+    fmap: FieldMap
+    # Optional: for continuation/stats labeling, expose params of the inner reg:
+    @property
+    def params(self): return self.inner.params
+
+    def energy_grad(self, ctx: RegContext) -> torch.Tensor:
+        # ctx.x is the "base image"; we ignore it and build u_ext ourselves
+        interior = ctx.write_interior_slice or (slice(None),) * ctx.x.ndim
+        u_ext = self.fmap.forward_ext(ctx.arena.ws, ctx.arena.idx, interior, halo={}, anchor=ctx.x)  # see notes below
+        # scratch grad(u): allocate like u_ext (LS lifetime or arena scratch)
+        gu = torch.zeros_like(u_ext, device=u_ext.device, dtype=ctx.dtype_c)
+        # Build a local RegContext that points TVND at u_ext and the scratch grad gu
+        inner_ctx = RegContext(
+            x=u_ext, g=gu, diag=None, roles_image=ctx.roles_image,
+            device=u_ext.device, dtype_c=ctx.dtype_c, dtype_r=ctx.dtype_r,
+            scale_field_shard=None, axes_resolver=ctx.axes_resolver,
+            arena=ctx.arena, write_interior_slice=interior,
+        )
+        E = self.inner.energy_grad(inner_ctx)  # fills gu with ∂E/∂u (no chain rule from scaling here)
+        # Chain rule back to parameters
+        gu_int = gu[interior] if interior is not None else gu
+        self.fmap.pullback_interior(gu_int, ctx.arena.ws, ctx.arena.idx, interior)
+        return E
+
+    # Optional pass-throughs
+    def add_diag(self, ctx: RegContext) -> None:
+        try: return self.inner.add_diag(ctx)
+        except AttributeError: return None
+    def continuation_update(self, stats) -> bool:
+        try: return bool(self.inner.continuation_update(stats))
+        except AttributeError: return False
+    def majorizer_diag(self, ctx: RegContext):
+        try: return self.inner.majorizer_diag(ctx)
+        except AttributeError: return None
+    def halo(self, roles):  # delegate if you need custom halo
+        try: return self.inner.halo(roles)
+        except AttributeError: return {}
+        
+        
+        
+@dataclass
+class LinearTimeMix(FieldMap):
+    U: torch.Tensor            # shape (B, K) on CPU or a cache per device
+    param_key: str = "V"       # ws buffer: (K, C, H, W, ...)
+    grad_key:  str = "g_V"     # ws buffer for its gradient
+    apply_inv_s: bool = False  # if True, u_ext = (U_ext @ V)[...] * (1/s_ext)
+
+    def _U_rows(self, start: int, stop: int, device: torch.device) -> torch.Tensor:
+        # Gather rows for halo-extended B_ext and move to device
+        return self.U[start:stop].to(device, non_blocking=True)
+
+    def forward_ext(self, ws, i: int, interior, halo, *, anchor: torch.Tensor) -> torch.Tensor:
+        # Build halo-extended range [B0-left : B1+right)
+        B_loc = ws.get("x", i).shape[0]
+        B0 = ws.shard_for_index(i).b_start
+        left  = int(interior[0].start or 0)
+        right = B_loc - int(interior[0].stop or B_loc)
+        row0 = B0 - left
+        row1 = B0 + B_loc + right
+
+        V = ws.get(self.param_key, i)              # (K, C, H, W, ...)
+        dev = V.device
+        U_ext = self._U_rows(row0, row1, dev)      # (B_ext, K)
+
+        # Reshape matmul: (B_ext, K) @ (K, N) -> (B_ext, N)
+        N = int(V.numel() // V.shape[0])           # flatten non-batch dims
+        V2 = V.reshape(V.shape[0], N)              # (K, N)
+        u2 = U_ext @ V2                             # (B_ext, N)
+        u_ext = u2.reshape((U_ext.shape[0],) + tuple(V.shape[1:])).to(dev)
+
+        if self.apply_inv_s and getattr(ws, "scale", None) is not None:
+            inv_s = ws.scale.inv_for_shard(ws.shard_for_index(i), anchor=V)  # (B_loc,1,...,1)
+            # extend inv_s to match halo-extended B_ext: repeat edge values
+            inv_ext = torch.cat([inv_s[0:1].expand(left,  *inv_s.shape[1:]),
+                                 inv_s,
+                                 inv_s[-1:].expand(right, *inv_s.shape[1:])], dim=0) if (left>0 or right>0) else inv_s
+            u_ext = u_ext * inv_ext
+        return u_ext
+
+    def pullback_interior(self, gu_int: torch.Tensor, ws, i: int, interior) -> None:
+        # If scaling was applied in forward: chain rule w.r.t. z = U V -> multiply by inv_s on interior
+        dev = gu_int.device
+        if self.apply_inv_s and getattr(ws, "scale", None) is not None:
+            inv_s = ws.scale.inv_for_shard(ws.shard_for_index(i), anchor=gu_int)  # (B_loc,1,...,1)
+            gu_int = gu_int * inv_s  # grad wrt z (before U)
+
+        # ∂E/∂V = U_int^H @ ∂E/∂z
+        B_loc = ws.get("x", i).shape[0]
+        left  = int(interior[0].start or 0)
+        right = B_loc - int(interior[0].stop or B_loc)
+        U_int = self._U_rows(ws.shard_for_index(i).b_start - left,
+                             ws.shard_for_index(i).b_start + B_loc + (0), dev)[left: left+B_loc]  # (B_loc,K)
+
+        gu2 = gu_int.reshape(B_loc, -1)  # (B_loc, N)
+        gV2 = U_int.conj().transpose(0,1) @ gu2  # (K, N)
+        gV  = gV2.reshape(ws.get(self.param_key, i).shape)
+        ws.get(self.grad_key, i).add_(gV)        # accumulate into parameter gradient

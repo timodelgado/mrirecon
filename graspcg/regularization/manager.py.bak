@@ -1,0 +1,409 @@
+# graspcg/regularization/manager.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Type
+
+import contextlib
+import torch
+
+from .base import Regularizer, RegParams, RegContext, AxesSpec
+from ..core.roles import resolve_axes, Roles
+
+# For TV percentile summaries (scalar-only stats path)
+from ..ops.ndops import fwd_diff, tv_iso_energy, tv_aniso_energy
+from .tv_nd import TVND
+
+
+@dataclass
+class RegSpec:
+    """
+    Construction-time specification for a single regularizer.
+    - kind: registry key (e.g., "tv")
+    - name: instance name (e.g., "tv_spatial"); must be unique in a manager
+    - params: dict of parameter overrides (weight, eps, axes, use_scale, ...)
+    """
+    kind: str
+    name: str
+    params: Mapping[str, Any]
+
+
+class RegManager:
+    """
+    Orchestrates a set of regularizers, one pass per shard:
+      • Builds RegContext (on the shard device)
+      • Applies per-term scale policy (optional) as 1/s (not 1/s^2)
+      • Dispatches energy+grad kernels (compile-friendly)
+      • Accumulates per-reg and total energies into StatsBoard
+      • (Optional) Emits TV percentiles via uniform subsample (scalar-only)
+
+    Notes on scaling:
+      - If reg.params.use_scale is True and a per-frame scale exists,
+        ctx.scale_field_shard is set to (B_loc,1,...,1) containing 1/s.
+      - Regularizers decide how to apply 1/s (e.g., exact TV(x/s) + chain rule).
+    """
+
+    def __init__(self,
+                 regs: Sequence[Regularizer],
+                 *,
+                 compile_kernels: bool = True,
+                 scale_sources: Optional[Mapping[str, torch.Tensor]] = None):
+        self._regs: List[Regularizer] = list(regs)
+        self._compile_kernels = bool(compile_kernels)
+        self._scale_sources: Dict[str, torch.Tensor] = dict(scale_sources or {})
+        self._local_registry: Dict[str, Type[Regularizer]] = {}   # kind -> class
+        self._kernel_cache: Dict[Tuple[Any, ...], Callable[[RegContext], torch.Tensor]] = {}
+
+    # ---------------- Registry & builders ----------------
+
+    def register(self, kind: str, cls: Type[Regularizer]) -> None:
+        self._local_registry[kind] = cls
+
+    @classmethod
+    def from_specs(cls,
+                   specs: Sequence[Mapping[str, Any]],
+                   *,
+                   registry: Optional[Mapping[str, Type[Regularizer]]] = None,
+                   compile_kernels: bool = True,
+                   scale_sources: Optional[Mapping[str, torch.Tensor]] = None) -> "RegManager":
+        reg_classes: Dict[str, Type[Regularizer]] = dict(registry or {})
+        regs: List[Regularizer] = []
+        for spec in specs:
+            kind = spec["kind"]; name = spec["name"]
+            params_dict = dict(spec.get("params", {}))
+            if kind not in reg_classes:
+                raise KeyError(f"Unknown regularizer kind '{kind}'. Provide via `registry`.")
+            RegCls = reg_classes[kind]
+            ParamCls = getattr(RegCls, "Params", RegParams)
+            params_obj = ParamCls(**params_dict)
+            regs.append(RegCls(name=name, params=params_obj))  # type: ignore[call-arg]
+        mgr = cls(regs, compile_kernels=compile_kernels, scale_sources=scale_sources)
+        for k, v in reg_classes.items():
+            mgr._local_registry[k] = v
+        return mgr
+
+    # ---------------- Main API (used by Objective/Precond/Solver) ----------------
+
+    @torch.no_grad()
+    def energy_and_grad(self, ws) -> torch.Tensor:
+        """
+        Compute total regularization energy and accumulate ∂E/∂x into ws.g.
+        Returns a 0‑D REAL tensor on a primary device. All math stays on devices.
+
+        Scalar-only StatsBoard:
+          • If ws.stats.enabled["reg_energy"] is True -> write E_reg/<name>
+          • If ws.stats.enabled["tv_quantile"] is True and reg is TVND:
+              - compute per-voxel TV magnitude on halo-extended x (optionally on x/s),
+              - take quantile on a uniform subsample per shard,
+              - aggregate across shards to a *single* tv_q/<name> scalar (primary device).
+        """
+        roles = ws.plan.roles_image
+        halo  = self._aggregate_halo(roles)
+        n_shards = self._num_shards(ws)
+
+        # Resolve axes ONCE per regularizer (compile-static)
+        reg_axes: List[Tuple[int, ...]] = []
+        for reg in self._regs:
+            axes_spec = getattr(getattr(reg, "params", None), "axes", "spatial")
+            reg_axes.append(self._resolve_axes(axes_spec, roles))
+
+        # Per-device accumulators (avoid host syncs)
+        dev_order: List[torch.device] = []
+        dev_accum: Dict[torch.device, torch.Tensor] = {}
+
+        # For tv_quantile: hold small per-shard samples per reg, to combine once at the end
+        samples_by_reg: Dict[str, List[torch.Tensor]] = {}
+
+        sb = getattr(ws, "stats", None)
+        collect_regE = bool(sb and sb.enabled.get("reg_energy", False))
+        collect_tvq  = bool(sb and sb.enabled.get("tv_quantile", False))
+        # Optional preferences provided by policy (fallback to sane defaults)
+        tvq_q   = float(getattr(sb, "tv_percentile", 0.90)) if sb is not None else 0.90
+        tvq_K   = int(getattr(sb, "tv_sample_K", 4096))     if sb is not None else 4096
+        tvq_K   = max(1, tvq_K)
+
+        for sh, i in ws.iter_shards():
+            dev = sh.device
+            if dev not in dev_accum:
+                # pick dtype from g.real for stability
+                g_dtype_r = ws.get("g", i).real.dtype
+                dev_accum[dev] = torch.zeros((), device=dev, dtype=g_dtype_r)
+                dev_order.append(dev)
+
+            # Optional CUDA stream
+            stream = ws.arena.stream_for(dev) if getattr(dev, "type", "cpu") == "cuda" else None
+            ctx_mgr = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+            with ctx_mgr:
+                x = ws.get("x", i)
+                g = ws.get("g", i)
+                D = ws.get("diag", i) if getattr(ws, "has", lambda _: False)("diag") else None
+
+                # halo-extended read (x_ext), interior write slice for g/diag
+                x_ext, interior = self._with_halo_x(ws, i, n_shards, halo, anchor=x)
+
+                # per-shard scale 1/s, if present
+                inv_s = self._inv_s_for_shard_if_enabled(ws, sh, anchor=x)
+
+                # run all regularizers on this shard
+                for reg, axes in zip(self._regs, reg_axes):
+                    # Choose 1/s only if this reg wants scaling; else pass None
+                    s_for_reg = inv_s if (getattr(reg, "params", None) and getattr(reg.params, "use_scale", False)) else None
+
+                    ctx = self.build_context(
+                        x=x_ext, g=g, diag=D, roles_image=roles, device=dev,
+                        dtype_c=x.dtype, dtype_r=g.real.dtype,
+                        scale_field_shard=s_for_reg,
+                        arena=ws.arena, write_interior_slice=interior,
+                    )
+
+                    fn = self._compiled_fixed_axes(reg, axes, self._kernel_signature_axes(reg, axes, ctx))
+                    e_shard = fn(ctx)  # 0‑D REAL tensor
+                    dev_accum[dev].add_(e_shard)
+
+                    if collect_regE:
+                        sb.scalar_slot(f"E_reg/{reg.name}", dev, e_shard.dtype).add_(e_shard)
+
+                    # --- TV percentile (scalar) path: compute small subsample per shard ---
+                    if collect_tvq and isinstance(reg, TVND):
+                        # Build (1/s) extended to match x_ext along halo, if scaling is on
+                        if s_for_reg is not None:
+                            B_ext = int(x_ext.shape[0])
+                            start = int(interior[0].start or 0)
+                            stop  = int(interior[0].stop  or B_ext)
+                            left, right = start, (B_ext - stop)
+                            invs = s_for_reg  # (B_loc,1,...,1)
+                            if left > 0 or right > 0:
+                                s_ext = torch.cat([
+                                    invs[0:1].expand(left,  *invs.shape[1:]),
+                                    invs,
+                                    invs[-1:].expand(right, *invs.shape[1:]),
+                                ], dim=0)
+                            else:
+                                s_ext = invs
+                            x_eff = x_ext * s_ext
+                        else:
+                            x_eff = x_ext
+
+                        # Per-voxel TV magnitude on halo-extended field (then restrict to interior)
+                        eps = torch.tensor(getattr(reg.params, "eps", 0.0), device=dev, dtype=g.real.dtype)
+                        axis_w = getattr(reg.params, "axis_weights", None)
+                        if axis_w is not None:
+                            if len(axis_w) != len(axes):
+                                raise ValueError(f"axis_weights must match len(axes) for reg {reg.name}")
+                            w_axes = [torch.tensor(float(w), device=dev, dtype=g.real.dtype) for w in axis_w]
+                            grads = [wi * fwd_diff(x_eff, ax) for wi, ax in zip(w_axes, axes)]
+                        else:
+                            grads = [fwd_diff(x_eff, ax) for ax in axes]
+
+                        e_den_full = tv_iso_energy(grads, eps) if getattr(reg.params, "isotropic", True) else tv_aniso_energy(grads, eps)
+                        e_den = e_den_full[interior] if interior is not None else e_den_full
+
+                        flat = e_den.reshape(-1)
+                        nvox = int(flat.numel())
+                        if nvox > 0:
+                            # uniform subsample bounded by K_shard
+                            K_shard = max(1, (tvq_K + n_shards - 1) // max(1, n_shards))
+                            stride  = max(1, nvox // K_shard)
+                            sample  = flat[::stride]
+                            if int(sample.numel()) > K_shard:
+                                sample = sample[:K_shard]
+                            samples_by_reg.setdefault(reg.name, []).append(sample)
+
+        # device reduction to a single 0‑D tensor (total reg energy)
+        if not dev_order:
+            return torch.zeros((), device="cpu", dtype=torch.float32)
+        primary = dev_order[0]
+        dtype_r = next(iter(dev_accum.values())).dtype
+        total = torch.zeros((), device=primary, dtype=dtype_r)
+        for dev in dev_order:
+            v = dev_accum[dev]
+            total.add_(v if dev == primary else v.to(primary, non_blocking=True))
+
+        # Emit tv_q/<name> once per reg (aggregate samples to primary device)
+        if collect_tvq and samples_by_reg:
+            for name, chunks in samples_by_reg.items():
+                if not chunks:
+                    continue
+                if len(chunks) == 1 and chunks[0].device == primary:
+                    S = chunks[0]
+                else:
+                    S = torch.cat([c if c.device == primary else c.to(primary, non_blocking=True) for c in chunks], dim=0)
+                if int(S.numel()) > 0:
+                    qv = torch.quantile(S, tvq_q)
+                    sb.scalar_slot(f"tv_q/{name}", primary, qv.dtype).add_(qv)
+
+        # also expose total for policies that read a single key
+        if sb is not None:
+            sb.scalar_slot("E_reg_total", primary, dtype_r).add_(total)
+
+        return total@torch.no_grad()
+    def add_diag(self, ws) -> None:
+        """
+        Convenience: invoke each regularizer's add_diag per shard with a minimal context.
+        """
+        roles = ws.plan.roles_image
+        halo  = self._aggregate_halo(roles)
+        n_shards = self._num_shards(ws)
+
+        for sh, i in ws.iter_shards():
+            x = ws.get("x", i)
+            g = ws.get("g", i)  # needed for dtype; not used by add_diag itself
+            D = ws.get("diag", i) if getattr(ws, "has", lambda _: False)("diag") else None
+            if D is None:
+                continue
+
+            x_ext, interior = self._with_halo_x(ws, i, n_shards, halo, anchor=x)
+            dev = x.device
+            for reg in self._regs:
+                s_for_reg = self._inv_s_for_shard_if_enabled(ws, sh, anchor=x) if (getattr(reg, "params", None) and getattr(reg.params, "use_scale", False)) else None
+                ctx = self.build_context(
+                    x=x_ext, g=g, diag=D, roles_image=roles, device=dev,
+                    dtype_c=x.dtype, dtype_r=g.real.dtype,
+                    scale_field_shard=s_for_reg,
+                    arena=ws.arena, write_interior_slice=interior,
+                )
+                if hasattr(reg, "add_diag"):
+                    reg.add_diag(ctx)
+
+    # ---------------- Continuation broadcast hook ----------------
+    def maybe_update(self, stats: Mapping[str, Any]) -> bool:
+        changed = False
+        for reg in self._regs:
+            try:
+                changed |= bool(reg.continuation_update(stats))
+            except AttributeError:
+                pass
+        return changed
+
+    # ---------------- Context & utilities ----------------
+    def build_context(self, *,
+                      x: torch.Tensor,
+                      g: torch.Tensor,
+                      diag: Optional[torch.Tensor],
+                      roles_image: Roles,
+                      device: torch.device,
+                      dtype_c: torch.dtype,
+                      dtype_r: torch.dtype,
+                      scale_field_shard: Optional[torch.Tensor],
+                      arena: Optional[Any],
+                      write_interior_slice: Optional[Tuple[slice, ...]] = None) -> RegContext:
+        return RegContext(
+            x=x, g=g, diag=diag, roles_image=roles_image, device=device,
+            dtype_c=dtype_c, dtype_r=dtype_r, scale_field_shard=scale_field_shard,
+            axes_resolver=lambda spec: self._resolve_axes(spec, roles_image),
+            arena=arena, write_interior_slice=write_interior_slice,
+        )
+
+    def set_scale_source(self, key: str, tensor: torch.Tensor) -> None:
+        """Attach or replace an external scale field source (e.g., 'data')."""
+        self._scale_sources[key] = tensor
+
+    # ---------------- Low-level helpers ----------------
+    @staticmethod
+    def _num_shards(ws) -> int:
+        n = getattr(ws, "num_shards", None)
+        if n is not None:
+            return int(n)
+        plan = getattr(ws, "plan", None)
+        if plan is not None and hasattr(plan, "num_shards"):
+            return int(plan.num_shards)  # type: ignore[attr-defined]
+        return sum(1 for _ in ws.iter_shards())
+
+    def _resolve_axes(self, spec: AxesSpec, roles: Roles) -> Tuple[int, ...]:
+        return resolve_axes(spec, roles)
+
+    def _aggregate_halo(self, roles: Roles) -> Dict[int, int]:
+        merged: Dict[int, int] = {}
+        for reg in self._regs:
+            try:
+                h = reg.halo(roles) or {}
+            except AttributeError:
+                h = {}
+            for ax, r in h.items():
+                r = int(r)
+                if r < 0:
+                    continue
+                merged[ax] = max(merged.get(ax, 0), r)
+        return merged
+
+    def _with_halo_x(self,
+                     ws,
+                     shard_idx: int,
+                     num_shards: int,
+                     halo_map: Dict[int, int],
+                     *,
+                     anchor: torch.Tensor) -> Tuple[torch.Tensor, Tuple[slice, ...]]:
+        """
+        Return (x_ext, interior_slice). We support halo only along the first 'unlike'
+        axis (absolute axis 0) because sharding happens there.
+        """
+        t_halo = int(halo_map.get(0, 0))
+        x_i = ws.get("x", shard_idx)
+        if t_halo <= 0:
+            return x_i, (slice(None),) * x_i.ndim
+
+        dev = x_i.device
+        prev_tail = None
+        next_head = None
+
+        if shard_idx > 0:
+            x_prev = ws.get("x", shard_idx - 1)
+            prev_tail = x_prev[-t_halo:].to(dev, non_blocking=True)
+        if shard_idx + 1 < num_shards:
+            x_next = ws.get("x", shard_idx + 1)
+            next_head = x_next[:t_halo].to(dev, non_blocking=True)
+
+        parts = [p for p in (prev_tail, x_i, next_head) if p is not None]
+        x_ext = torch.cat(parts, dim=0) if len(parts) > 1 else x_i
+        # interior slice (drop halo rows on writes)
+        interior = [slice(None)] * x_ext.ndim
+        start = t_halo if prev_tail is not None else 0
+        stop  = start + x_i.shape[0]
+        interior[0] = slice(start, stop)
+        return x_ext, tuple(interior)
+
+    def _inv_s_for_shard_if_enabled(self, ws, sh, anchor: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Query a per-frame scale 1/s. Priority:
+          1) ws.scale.inv_s_for_shard(...) if present,
+          2) a tensor source in self._scale_sources (global or (B,1,...,1) CPU),
+          3) None (scaling off).
+        """
+        if hasattr(ws, "scale") and hasattr(ws.scale, "inv_s_for_shard"):
+            return ws.scale.inv_s_for_shard(sh, anchor=anchor)
+        # fallback: external source (full-B), slice by shard if shape matches
+        if "data" in self._scale_sources:
+            full = self._scale_sources["data"]
+            if full.ndim >= 1 and full.shape[0] == ws.plan.image_shape[0]:
+                B0, B1 = sh.b_start, sh.b_stop
+                return full[B0:B1].to(anchor.device, non_blocking=True)
+            return full.to(anchor.device, non_blocking=True)
+        return None
+
+    def _kernel_signature_axes(self, reg: Regularizer, axes: Tuple[int, ...], ctx: RegContext) -> Tuple[Any, ...]:
+        # signature must not capture large tensors; only shapes/dtypes/devices
+        return (type(reg), tuple(int(a) for a in axes), ctx.device, ctx.dtype_c, ctx.dtype_r)
+
+    def _compiled_fixed_axes(self, reg: Regularizer, axes: Tuple[int, ...], sig: Tuple[Any, ...]) -> Callable[[RegContext], torch.Tensor]:
+        fn = self._kernel_cache.get(sig)
+        if fn is not None:
+            return fn
+
+        # prefer fixed-axes kernel if available
+        if hasattr(reg, "energy_grad_fixed_axes"):
+            def inner(ctx: RegContext) -> torch.Tensor:
+                return reg.energy_grad_fixed_axes(ctx, axes)
+        else:
+            def inner(ctx: RegContext) -> torch.Tensor:
+                return reg.energy_grad(ctx)
+
+        # Optional: hand off to torch.compile when requested by the caller
+        if self._compile_kernels and hasattr(torch, "compile"):
+            try:
+                inner = torch.compile(inner, fullgraph=False, dynamic=False)  # type: ignore[arg-type]
+            except Exception:
+                # still cache the eager version
+                pass
+
+        self._kernel_cache[sig] = inner
+        return inner
