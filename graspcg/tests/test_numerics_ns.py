@@ -225,6 +225,29 @@ def test_line_search_wolfe_zoom_path(device):
     assert gdot_t.abs().item() <= (-solver.c2 * g0d).item() + 1e-6
 
 
+@pytest.mark.parametrize("device", device_list())
+def test_line_search_rejects_non_descent(device):
+    """If g·d ≥ 0, line search should reject the step and return t=0."""
+    solver = _build_solver(device, ls_name="armijo", with_tv=False)
+
+    for sh, i in solver.ws.iter_shards():
+        x = _rand_cplx(solver.ws.get("x", i).shape, device, scale=0.1, seed=4321)
+        solver.ws.get("x", i).copy_(x)
+        solver.ws.get("dx", i).copy_(x)
+
+    from graspcg.numerics.line_search import search as line_search
+    ok, t, f_t, gdot_t = line_search(solver)
+
+    assert not bool(ok.item())
+    assert torch.allclose(t, torch.zeros_like(t), atol=1e-6)
+
+    solver.obj.begin_linesearch(solver.ws)
+    f0, g0d = solver.obj.f_g_tensor(solver.ws, torch.zeros_like(t))
+    solver.obj.end_linesearch(solver.ws)
+    assert torch.allclose(f_t, f0)
+    assert torch.allclose(gdot_t, g0d)
+
+
 # -------------------------
 # Directions tests
 # -------------------------
