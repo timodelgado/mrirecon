@@ -12,7 +12,7 @@ from ..workspace.workspace import Workspace, BufSpec
 # Objective / regs / policy / stats
 from ..ops.objective import Objective
 from ..regularization.manager import RegManager
-from ..policies.reg_policies import RegPolicy, RegPolicyConfig
+from ..regularization.policies import RegPolicy, RegPolicyConfig
 from ..regularization.stats_board import StatsBoard
 
 # Directions + line search (numerics live outside the solver)
