@@ -14,7 +14,7 @@ class GraphLapParams(RegParams):
     # 'none' -> L = D - W
     # 'rw'   -> L = I - D^{-1} W
     # 'sym'  -> L = I - D^{-1/2} W D^{-1/2}
-    normalize: str = "none"
+    normalize: str = "none" # "none" | "row" | "sym"
     # Matmul along spatial columns is chunked to limit peak memory.
     # Each chunk computes (B x chunk_cols); tune based on VRAM.
     mm_chunk_cols: int = 65536
@@ -250,9 +250,9 @@ class GraphLaplacian(Regularizer):
 
         norm = (self.params.normalize or "none").lower()
         if norm == "none":
-            v = cache["deg"]           # per-frame degrees
+            v = cache["deg"]                    # per-frame degrees
         else:
-            v = torch.ones_like(cache["deg"])  # diag(L)=1 for rw and sym
+            v = (cache["deg"] > 0).to(cache["deg"].dtype)  # 1 on non-isolated node
 
         # Optional temporal scaling (B_loc,1,1,...)
         inv_s2 = None
@@ -279,3 +279,42 @@ class GraphLaplacian(Regularizer):
     def majorizer_diag(self, ctx: RegContext):
         # We prefer the exact degree-aware add_diag; return 0 to avoid double add.
         return torch.zeros((), device=ctx.device, dtype=ctx.dtype_r)
+
+
+
+    def majorizer_profile(self, ctx: RegContext):
+        """
+        Return a 1-D diagonal profile along axis 0 (time/batch):
+            v_t = λ * degree[t]              (normalize='none')
+            v_t = λ * 1{deg[t]>0}            (normalize='row' or 'sym')  # diag(L_norm) = 1
+        The manager will broadcast-add this over spatial dims.
+        """
+        lam = float(self.params.weight)
+        if lam == 0.0:
+            return None
+
+        # Determine shard rows for the *interior* frames
+        ws  = getattr(ctx, "ws", None)
+        i   = getattr(ctx, "shard_index", None)
+        if (ws is not None) and (i is not None):
+            sh   = ws.shard_for_index(i)
+            row0 = int(sh.b_start)
+            row1 = int(sh.b_stop)
+        else:
+            # Single-shard / dummy test case: take B from the interior x slice
+            B_int = int(ctx.x[ctx.write_interior_slice].shape[0])
+            row0, row1 = 0, B_int
+
+        deg = self._deg_cpu[row0:row1]  # 1‑D CPU tensor
+
+        norm = (self.params.normalize or "none").lower()
+        if norm == "none":
+            v_cpu = deg * lam
+        else:
+            # For both random-walk and symmetric normalized Laplacians,
+            # diag(L_norm) = 1 on nodes with deg>0 (no self loops),
+            # and 0 for isolated nodes.
+            v_cpu = (deg > 0).to(deg.dtype) * lam
+
+        v = v_cpu.to(device=ctx.device, dtype=ctx.dtype_r, non_blocking=True)
+        return [(0, v)]  # (axis=0, profile=v)
