@@ -60,7 +60,11 @@ class DummyWS:
         return self._shard
     def iter_shards(self):
         yield self._shard, 0
-
+    def _safe_get(self, name, i, default=None):
+        try:
+            return self.get(name, i)
+        except Exception:
+            return default
 # ---- tests ----
 
 @pytest.mark.parametrize("device", [torch.device("cpu")])

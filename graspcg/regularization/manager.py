@@ -92,8 +92,9 @@ class RegManager:
         for sh, i in ws.iter_shards():
             dev = sh.device
             if dev not in dev_accum:
-                g_dtype_r = ws.get("g", i).real.dtype
-                dev_accum[dev] = torch.zeros((), device=dev, dtype=g_dtype_r)
+                # Anchor dtype on x.real (FakeWS may not expose 'g')
+                x_dtype_r = ws.get("x", i).real.dtype
+                dev_accum[dev] = torch.zeros((), device=dev, dtype=x_dtype_r)
                 dev_order.append(dev)
 
             stream = ws.arena.stream_for(dev) if getattr(dev, "type", "cpu") == "cuda" else None
@@ -173,49 +174,87 @@ class RegManager:
             sb.scalar_slot("E_reg_total", primary, dtype_r).add_(total)
     
         return total
-    
+
     @torch.no_grad()
     def add_diag(self, ws) -> None:
         """
-        Ask each regularizer to add its diagonal contribution (operator-aware)
-        to ws.diag per shard. This version is robust to minimal FakeWS objects.
-        """
-        from .base import RegContext
+        Invoke each regularizer's diagonal contribution per shard.
 
+        Order of preference per reg:
+        1) axis-profile majorizer (e.g., temporal degree) → cheap & deterministic
+        2) the reg's own image-dependent add_diag (lagged-diffusivity)
+        3) mapped regs may still terminalize into parameter diags via op.diag_push
+            even when image diag is absent.
+        """
         roles = ws.plan.roles_image
         halo  = self._aggregate_halo(roles)
         n_shards = self._num_shards(ws)
 
-        has = getattr(ws, "has", lambda _: False)
+        has_img_diag = getattr(ws, "has", lambda _: False)("diag")
+
+        # Detect whether any mapped op wants to write a parameter-space diagonal
+        def _has_param_diag() -> bool:
+            for reg in self._regs:
+                op = getattr(getattr(reg, "_mr", None), "op", None)  # Transformed(...)._mr.op
+                diag_key = getattr(op, "diag_key", None)
+                if isinstance(diag_key, str) and getattr(ws, "has", lambda _: False)(diag_key):
+                    return True
+            return False
+
+        if not (has_img_diag or _has_param_diag()):
+            return  # nothing to do anywhere
 
         for sh, i in ws.iter_shards():
-            x = ws.get("x", i)
-            D = ws.get("diag", i) if has("diag") else None
-            if D is None:
-                continue  # nothing to add to
+            # Required x; continue if missing
+            try:
+                x = ws.get("x", i)
+            except Exception:
+                continue
 
-            # Use an ephemeral gradient buffer if WS doesn't expose one
-            g = ws.get("g", i) if has("g") else torch.zeros_like(x, dtype=x.dtype, device=x.device)
+            # Optional image diag for this shard
+            D = ws.get("diag", i) if has_img_diag else None
 
-            # Respect temporal halo on the mapped field
+            # NO large gradient allocation here
+            g_placeholder = torch.empty(0, dtype=x.dtype, device=x.device)
+
             x_ext, interior = self._with_halo_x(ws, i, n_shards, halo, anchor=x)
             dev = x.device
 
             for reg in self._regs:
                 ctx = RegContext(
-                    x=x_ext, g=g, diag=D, roles_image=roles, device=dev,
-                    dtype_c=x.dtype, dtype_r=g.real.dtype,
+                    x=x_ext, g=g_placeholder, diag=D, roles_image=roles, device=dev,
+                    dtype_c=x.dtype, dtype_r=x.real.dtype,
                     axes_resolver=lambda spec: self._resolve_axes(spec, roles),
                     arena=ws.arena, write_interior_slice=interior,
                     ws=ws, shard_index=i, halo_map=halo,
                 )
-                try:
-                    # Let the regularizer (or mapped wrapper) do the operator-aware thing.
-                    reg.add_diag(ctx)
-                except Exception:
-                    # Preconditioner is an enhancement; never make it fatal.
-                    pass
 
+                # --- (1) axis-profile path if we do have an image diag ---
+                if D is not None:
+                    prof = getattr(reg, "majorizer_profile", None)
+                    if callable(prof):
+                        try:
+                            prof_list = prof(ctx)
+                            if prof_list:
+                                Dint = D[interior]
+                                for axis, v1d in prof_list:
+                                    v = v1d.to(Dint.device, dtype=Dint.dtype)
+                                    shape = [1] * Dint.ndim
+                                    shape[int(axis)] = -1
+                                    Dint.add_(v.reshape(shape))
+                                continue  # profile handled this reg
+                        except Exception:
+                            # profile is an optimization; fall through to reg.add_diag
+                            pass
+
+                # --- (2) image-dependent path OR (3) parameter-diag push path ---
+                try:
+                    reg.add_diag(ctx)
+                    # Note: Transformed(...).add_diag will push to parameter diag via op.diag_push
+                    # even when ctx.diag is None (e.g., TemporalBasisOp→diag_V).
+                except Exception:
+                    # diagonal is an enhancement; never be fatal
+                    pass
 
 
     # ---------------- Continuation broadcast hook ----------------

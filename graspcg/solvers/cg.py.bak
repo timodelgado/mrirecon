@@ -89,14 +89,14 @@ class CGSolver:
         CPLX = y.dtype if y.is_complex() else torch.complex64
         REAL = torch.float32
         specs = [
-            BufSpec("var",    "image",  "per_shard", "image",   CPLX, init="zeros"),
-            BufSpec("grad",    "image",  "per_shard", "image",   CPLX, init="zeros"),
-            BufSpec("dir",   "image",  "per_shard", "image",   CPLX, init="zeros"),
+            BufSpec("x",    "image",  "per_shard", "image",   CPLX, init="zeros"),
+            BufSpec("g",    "image",  "per_shard", "image",   CPLX, init="zeros"),
+            BufSpec("dx",   "image",  "per_shard", "image",   CPLX, init="zeros"),
             BufSpec("diag", "image",  "per_shard", "spatial", REAL, init="ones"),
             # Preferred per‑shard LS caches (Objective will use them if present)
-            BufSpec("fwd_var_sh","kspace","per_shard","kspace", CPLX, init="zeros", lifetime="ls"),
-            BufSpec("fwd_dir_sh","kspace","per_shard","kspace", CPLX, init="zeros", lifetime="ls"),
-            BufSpec("resid_sh", "kspace","per_shard","kspace", CPLX, init="zeros", lifetime="ls"),
+            BufSpec("Ax_sh","kspace","per_shard","kspace", CPLX, init="zeros", lifetime="ls"),
+            BufSpec("Ad_sh","kspace","per_shard","kspace", CPLX, init="zeros", lifetime="ls"),
+            BufSpec("r_sh", "kspace","per_shard","kspace", CPLX, init="zeros", lifetime="ls"),
         ]
         if self.cfg.direction.lower() in ("prplus", "dy"):
             specs.append(BufSpec("g_prev", "image", "per_shard", "image", CPLX, init="zeros"))

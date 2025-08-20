@@ -103,7 +103,7 @@ class ScaleOp:
             return (axis, v1d)
 
         sh = ws.shard_for_index(i)
-        inv_s_int = ws.scale.inv_for_shard(sh, anchor=ctx.g[interior])  # (B_loc,1,1,1)
+        inv_s_int = ws.scale.inv_for_shard(sh, anchor=ctx.x[interior])  # (B_loc,1,1,1)
         inv_s_1d  = inv_s_int.reshape(inv_s_int.shape[0])               # (B_loc,)
         v = v1d.to(inv_s_1d.device, dtype=inv_s_1d.dtype)
         v = v * (inv_s_1d * inv_s_1d)
@@ -166,8 +166,8 @@ class TemporalBasisOp:
         gV  = gV2.reshape(V.shape)
         ws.get(self.grad_key, i).add_(gV)
 
-        # return zeros (no gradient to a previous z)
-        return torch.zeros_like(ctx.g[interior])
+        # return zeros (no gradient to a previous z); anchor on x not g
+        return torch.zeros_like(ctx.x[interior])
 
     def halo_extra(self, roles: Roles) -> Dict[int, int]: return {}
     def roles_for_output(self, roles: Roles) -> Roles:

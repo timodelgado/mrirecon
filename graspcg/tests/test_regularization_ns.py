@@ -3,14 +3,20 @@ import math
 import torch
 import pytest
 
+
 from ..regularization.tv_nd import TVND, TVParams
-from ..regularization.manager import RegManager
+from ..regularization.manager import RegManager, RegContext
 from ..regularization.stats_board import StatsBoard
 from ..regularization.mapping import MappedRegularizer, IdentityOp, TemporalBasisOp, ComposeOp
 from ..core.roles import Roles
 
 # -------------------------- helpers / fakes --------------------------
-
+def device_list():
+    devices = [torch.device("cpu")]
+    if torch.cuda.is_available():
+        devices.append(torch.device("cuda:0"))
+        devices.append(torch.device("cuda:1"))
+    return devices
 class _Arena:
     def stream_for(self, device):
         return None
@@ -74,7 +80,11 @@ class FakeWS:
 
     def has(self, name):
         return name in self.buffers
-
+    def _safe_get(self, name, i, default=None):
+        try:
+            return self.get(name, i)
+        except Exception:
+            return default
 # -------------------------- fixtures --------------------------
 
 def device_list():
@@ -188,3 +198,85 @@ def test_add_diag_behavior_identity_vs_mapped(device):
     regm2.add_diag(ws2)
     d2_after = ws2.get("diag", 0)
     assert torch.allclose(d2_after, d2_before)
+
+@pytest.mark.parametrize("device", device_list())
+def test_graph_diag_degree(device):
+    B, C, H, W = 5, 1, 4, 3
+    x = torch.zeros((B,C,H,W), device=device, dtype=torch.complex64)
+    g = torch.zeros_like(x)
+    D = torch.zeros_like(x.real)
+
+    # Simple chain: neighbors weight=1 -> deg=[1,2,2,2,1]
+    W = torch.zeros(B, B)
+    for t in range(B-1):
+        W[t, t+1] = 1.0; W[t+1, t] = 1.0
+
+    from graspcg.core.roles import Roles
+    from types import SimpleNamespace
+    from graspcg.regularization.graph_laplacian import GraphLaplacian, GraphLapParams
+
+    reg = GraphLaplacian("gl", W, GraphLapParams(weight=2.0, normalize="none"))
+
+    class WS:
+        def __init__(self): self._bufs={"x":[x], "g":[g], "diag":[D]}
+        def iter_shards(self): yield (SimpleNamespace(b_start=0,b_stop=B), 0)
+        def get(self, k, i): return self._bufs[k][i]
+        def shard_for_index(self, i): return SimpleNamespace(b_start=0, b_stop=B)
+        @property
+        def plan(self): return SimpleNamespace(roles_image=Roles(unlike=1, like=1, nufft=2))
+        @property
+        def arena(self): return None
+
+    ws = WS()
+    # Minimal context per manager.add_diag impl
+    from graspcg.regularization.manager import RegManager
+    RegManager([reg]).add_diag(ws)
+
+    deg = torch.tensor([1,2,2,2,1], dtype=D.dtype, device=device) * 2.0
+    target = deg.view(B,1,1,1).expand_as(D)
+    assert torch.allclose(D, target, atol=1e-6, rtol=0)
+
+@pytest.mark.parametrize("device", device_list())
+def test_graph_energy_grad_matches_fd(device):
+    B, C, H, W = 6, 1, 4, 4
+    x = (torch.randn((B,C,H,W), device=device, dtype=torch.complex64) * 0.05).requires_grad_(False)
+    g = torch.zeros_like(x)
+    D = torch.ones_like(x.real)
+
+    W = torch.rand(B, B); W = 0.5*(W+W.t()); W.fill_diagonal_(0)
+    from graspcg.regularization.graph_laplacian import GraphLaplacian, GraphLapParams
+    reg = GraphLaplacian("gl", W, GraphLapParams(weight=1e-3, normalize="sym"))
+
+    from graspcg.core.roles import Roles
+    ctx = RegContext(
+        x=x, g=g, diag=D, roles_image=Roles(unlike=1, like=1, nufft=2),
+        device=x.device, dtype_c=x.dtype, dtype_r=x.real.dtype,
+        axes_resolver=lambda spec:(1,2,3), arena=None,
+        write_interior_slice=(slice(None),)*x.ndim,
+        ws=type("W", (), {
+            "iter_shards": lambda self: [ (type("S", (), {"b_start":0,"b_stop":B})(), 0) ].__iter__(),
+            "get": lambda self,k,i: {"x":x,"g":g,"diag":D}[k],
+            "shard_for_index": lambda self,i: type("S", (), {"b_start":0,"b_stop":B})()
+        })(), shard_index=0
+    )
+
+    # Analytical E, g
+    E0 = reg.energy_grad(ctx)
+    g0 = g.clone()
+
+    # Finite-difference slope along random d
+    d = torch.randn_like(x) * 0.1
+    eps = torch.tensor(1e-4, device=device, dtype=x.real.dtype)
+
+    def E_at(t):
+        xt = x + (t * d)
+        gtmp = torch.zeros_like(gtmp := g)
+        # re-evaluate through a fresh context
+        ctx2 = RegContext(**{**ctx.__dict__, "x": xt, "g": gtmp})
+        return reg.energy_grad(ctx2)
+
+    Ep = E_at(eps); Em = E_at(-eps)
+    gdot_fd = ((Ep - Em) / (2*eps)).item()
+
+    gdot_an = (g0.conj() * d).real.sum().item()
+    assert abs(gdot_an - gdot_fd) < 5e-4

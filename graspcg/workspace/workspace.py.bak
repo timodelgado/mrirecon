@@ -13,7 +13,6 @@ import psutil  # optional; used to estimate CPU RAM if needed
 
 from .unified_arena import DeviceArena
 from ..core.roles import Roles
-from ..compat.names import CANONICAL, ALIAS_TO_CANON
 
 
 # ==============================
@@ -122,23 +121,6 @@ class WorkspacePlan:
 # Workspace core
 # ==============================
 class Workspace:
-    # -- alias installation --------------------------------------------------
-    def _install_aliases(self) -> None:
-        """
-        Ensure canonical names and their aliases point to the same storage.
-        Works for both global buffers (Tensor) and per_shard buffers (list[Tensor]).
-        """
-        # Find any present key among canon+aliases; bind all to the first found.
-        for canon, aliases in CANONICAL.items():
-            group = [canon] + list(aliases)
-            present_key = next((k for k in group if k in self._bufs), None)
-            if present_key is None:
-                continue
-            base_obj = self._bufs[present_key]
-            for k in group:
-                self._bufs[k] = base_obj
-
-
     """
     Solver-agnostic workspace that:
       1) infers image/k-space shapes,
@@ -211,8 +193,6 @@ class Workspace:
         self.dtype_c   = dtype_c
         self.dtype_r   = dtype_r
         self.kspace_mode = kspace_mode
-        # problem-agnostic constants (optional):
-        self.fixed: dict[str, object] = {}
 
         # Manifest defaults
         self.specs = list(buf_specs)
@@ -238,11 +218,6 @@ class Workspace:
 
         # allocate per the manifest
         self._allocate_from(self.specs)
-        # expose canonical <-> alias names so both work everywhere
-        try:
-            self._install_aliases()
-        except Exception:
-            pass
 
     # ---------- manifest helpers ----------
     def _normalize_specs_inplace(self) -> None:
@@ -705,9 +680,3 @@ class Workspace:
     def primary_device(self) -> torch.device:
         # First shard device if available; otherwise align with y
         return self.plan.shards[0].device if self.plan.shards else self.y.device
-    # -------- convenience properties --------
-    @property
-    def data(self):
-        """Acquired signal (canonical name). Alias to `y`."""
-        return self.y
-

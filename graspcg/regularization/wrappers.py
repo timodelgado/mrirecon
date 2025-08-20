@@ -59,7 +59,23 @@ class Transformed(Regularizer):
                 arena=ctx.arena, write_interior_slice=interior,
                 ws=ctx.ws, shard_index=ctx.shard_index, halo_map=ctx.halo_map,
             )
-
+            # (A) Try profile majorizer first (push through op), if caller provided image diag.
+            if ctx.diag is not None:
+                prof_fn = getattr(self.base, "majorizer_profile", None)
+                if callable(prof_fn):
+                    prof_list = prof_fn(sub)
+                    if prof_list:
+                        axis, v1d = prof_list[0]  # TVND returns only time-axis
+                        if hasattr(self._mr.op, "diag_push_profile"):
+                            pushed = self._mr.op.diag_push_profile(axis, v1d, ctx, interior)
+                            if pushed is not None:
+                                axis2, v1d2 = pushed
+                                Dint = ctx.diag[interior]
+                                v = v1d2.to(Dint.device, dtype=Dint.dtype)
+                                shape = [1] * Dint.ndim
+                                shape[int(axis2)] = -1
+                                Dint.add_(v.reshape(shape))
+                                return
             k = None
             try:
                 k = self.base.majorizer_diag(sub)
@@ -90,6 +106,7 @@ class Transformed(Regularizer):
         except Exception:
             # Keep this very safe—diag is a preconditioner enhancement.
             # If anything goes wrong, we silently skip the addition.
+            print('Warning: Failed to add diag for transformed regularizer', self.name)
             return None
 
 
