@@ -1,1 +1,0 @@
-"""Regularization operators and policies for GRASP-CG."""
