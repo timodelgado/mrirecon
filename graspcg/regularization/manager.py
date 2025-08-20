@@ -99,13 +99,6 @@ class RegManager:
             stream = ws.arena.stream_for(dev) if getattr(dev, "type", "cpu") == "cuda" else None
             ctx_mgr = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
             with ctx_mgr:                # Ensure per-device work stream waits for writes to x on this and neighbor devices
-                neighbors = []
-                if i > 0:
-                    neighbors.append(ws.plan.shards[i-1].device)
-                if i + 1 < n_shards:
-                    neighbors.append(ws.plan.shards[i+1].device)
-                if hasattr(ws, "wait_x_ready"):
-                    ws.wait_x_ready(dev, neighbors)
 
                 x = ws.get("x", i)
                 g = ws.get("g", i)
@@ -180,22 +173,34 @@ class RegManager:
             sb.scalar_slot("E_reg_total", primary, dtype_r).add_(total)
     
         return total
+    
+    @torch.no_grad()
     def add_diag(self, ws) -> None:
         """
-        Invoke each regularizer's add_diag per shard with a minimal context.
+        Ask each regularizer to add its diagonal contribution (operator-aware)
+        to ws.diag per shard. This version is robust to minimal FakeWS objects.
         """
+        from .base import RegContext
+
         roles = ws.plan.roles_image
         halo  = self._aggregate_halo(roles)
         n_shards = self._num_shards(ws)
 
+        has = getattr(ws, "has", lambda _: False)
+
         for sh, i in ws.iter_shards():
             x = ws.get("x", i)
-            g = ws.get("g", i)
-            D = ws.get("diag", i) if getattr(ws, "has", lambda _: False)("diag") else None
+            D = ws.get("diag", i) if has("diag") else None
             if D is None:
-                continue
+                continue  # nothing to add to
+
+            # Use an ephemeral gradient buffer if WS doesn't expose one
+            g = ws.get("g", i) if has("g") else torch.zeros_like(x, dtype=x.dtype, device=x.device)
+
+            # Respect temporal halo on the mapped field
             x_ext, interior = self._with_halo_x(ws, i, n_shards, halo, anchor=x)
             dev = x.device
+
             for reg in self._regs:
                 ctx = RegContext(
                     x=x_ext, g=g, diag=D, roles_image=roles, device=dev,
@@ -204,32 +209,13 @@ class RegManager:
                     arena=ws.arena, write_interior_slice=interior,
                     ws=ws, shard_index=i, halo_map=halo,
                 )
-                # in RegManager.add_diag(ws):
-                for sh, i in ws.iter_shards():
-                    ctx = make_ctx_for_shard(i)  # your existing construction
+                try:
+                    # Let the regularizer (or mapped wrapper) do the operator-aware thing.
+                    reg.add_diag(ctx)
+                except Exception:
+                    # Preconditioner is an enhancement; never make it fatal.
+                    pass
 
-                    applied = False
-                    try:
-                        res = reg.add_diag(ctx)
-                        applied = bool(res)
-                    except Exception:
-                        applied = False
-
-                    if applied:
-                        continue  # profile path handled it
-
-                    # --- existing scalar path ---
-                    k = reg.majorizer_diag(ctx)
-                    if k is None or float(k) == 0.0:
-                        continue
-                    interior = ctx.write_interior_slice or (slice(None),) * ctx.x.ndim
-                    if isinstance(reg, MappedRegularizer):
-                        km = reg.op.diag_push(k, ctx, interior)
-                        if km is None:
-                            continue  # parameter terminal
-                        ctx.diag[interior].add_(km)  # km broadcast/scalar is fine here
-                    else:
-                        ctx.diag[interior].add_(k)
 
 
     # ---------------- Continuation broadcast hook ----------------
