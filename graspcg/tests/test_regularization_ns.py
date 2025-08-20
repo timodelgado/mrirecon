@@ -226,6 +226,7 @@ def test_graph_diag_degree(device):
         def plan(self): return SimpleNamespace(roles_image=Roles(unlike=1, like=1, nufft=2))
         @property
         def arena(self): return None
+        def has(self, k): return k in self._bufs
 
     ws = WS()
     # Minimal context per manager.add_diag impl
@@ -256,7 +257,7 @@ def test_graph_energy_grad_matches_fd(device):
         ws=type("W", (), {
             "iter_shards": lambda self: [ (type("S", (), {"b_start":0,"b_stop":B})(), 0) ].__iter__(),
             "get": lambda self,k,i: {"x":x,"g":g,"diag":D}[k],
-            "shard_for_index": lambda self,i: type("S", (), {"b_start":0,"b_stop":B})()
+            "shard_for_index": lambda self,i: type("S", (), {"b_start":0,"b_stop":B},)()
         })(), shard_index=0
     )
 

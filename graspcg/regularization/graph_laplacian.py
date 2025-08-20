@@ -252,8 +252,9 @@ class GraphLaplacian(Regularizer):
         if norm == "none":
             v = cache["deg"]                    # per-frame degrees
         else:
-            v = (cache["deg"] > 0).to(cache["deg"].dtype)  # 1 on non-isolated node
-
+            # diag(L_norm)=1 for nodes with deg>0 (no self-loops); 0 if isolated
+            v = (cache["deg"] > 0).to(cache["deg"].dtype)
+    
         # Optional temporal scaling (B_loc,1,1,...)
         inv_s2 = None
         ws = getattr(ctx, "ws", None)
