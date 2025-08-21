@@ -256,7 +256,6 @@ class RegManager:
                     # diagonal is an enhancement; never be fatal
                     pass
 
-
     # ---------------- Continuation broadcast hook ----------------
     def maybe_update(self, stats: Mapping[str, Any]) -> bool:
         changed = False
