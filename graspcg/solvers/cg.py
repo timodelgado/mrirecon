@@ -1,0 +1,288 @@
+# graspcg/solvers/cg.py
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+
+# Arena / workspace
+from ..workspace.unified_arena import DeviceArena
+from ..workspace.workspace import Workspace, BufSpec
+
+# Objective / regs / policy / stats
+from ..ops.objective import Objective
+from ..regularization.manager import RegManager
+from ..regularization.policies import RegPolicy, RegPolicyConfig
+from ..regularization.stats_board import StatsBoard
+
+# Directions + line search (numerics live outside the solver)
+from ..numerics.directions import DirPRPlus, DirDY, DirFR
+from ..numerics.line_search import search as line_search
+
+# Shared solver utilities
+from .utils import (
+    xnorm0, stepnorm0, gnorm_precond0, converged,
+    preallocate_stats, history_from_stats
+)
+
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CGConfig:
+    # devices: compute + helpers specification accepted by DeviceArena
+    devices: Optional[torch.device | str | int | list | tuple] = None
+    # direction: "fr" (default), "prplus", or "dy"
+    direction: str = "fr"
+    # line-search
+    ls_name: str = "armijo"   # "armijo" (default) or "wolfe"
+    c1: float = 1e-4
+    c2: float = 0.9
+    ls_beta: float = 0.5
+    ls_max_iter: int = 20
+    ls_zoom: bool = True
+    # iterations / tolerances
+    max_iter: int = 50
+    tol_g: float = 1e-4
+    tol_step: float = 1e-9
+    # init
+    init_mode: str = "keep"   # "keep", "zero", "backproj"
+    backproj_xfactor: float = 1.0
+    # logging
+    record_history: bool = True
+    verbose: bool = False
+
+# ---------------------------------------------------------------------------
+
+class CGSolver:
+    """
+    Preconditioned non‑linear CG (orchestration only).
+
+    • Compiled numerics live in Objective (data) + RegManager (reg).
+    • Continuation is solver‑agnostic via RegPolicy with scalar‑only StatsBoard.
+    • Multi‑device friendly; keep 0‑D tensors on device; convert in history().
+    """
+
+    def __init__(self,
+                 y: torch.Tensor,
+                 nufft_op,
+                 regm: RegManager,
+                 cfg: Optional[CGConfig] = None):
+        self.cfg = cfg or CGConfig()
+        self.y = y
+        self.nufft_op = nufft_op
+        self.regm = regm
+
+        # -------- arena --------
+        devices = self.cfg.devices
+        if devices is None:
+            compute_spec, helpers = "cuda", None
+        elif isinstance(devices, (list, tuple)):
+            compute_spec, helpers = devices[0], list(devices[1:])
+        else:
+            compute_spec, helpers = devices, None
+        try:
+            self.arena = DeviceArena(compute=compute_spec, helpers=helpers)
+        except TypeError:
+            self.arena = DeviceArena(compute=compute_spec)
+
+        # -------- manifest --------
+        CPLX = y.dtype if y.is_complex() else torch.complex64
+        REAL = torch.float32
+        specs = [
+            BufSpec("var",    "image",  "per_shard", "image",   CPLX, init="zeros"),
+            BufSpec("grad",    "image",  "per_shard", "image",   CPLX, init="zeros"),
+            BufSpec("dir",   "image",  "per_shard", "image",   CPLX, init="zeros"),
+            BufSpec("diag", "image",  "per_shard", "spatial", REAL, init="ones"),
+            # Preferred per‑shard LS caches (Objective will use them if present)
+            BufSpec("fwd_var_sh","kspace","per_shard","kspace", CPLX, init="zeros", lifetime="ls"),
+            BufSpec("fwd_dir_sh","kspace","per_shard","kspace", CPLX, init="zeros", lifetime="ls"),
+            BufSpec("resid_sh", "kspace","per_shard","kspace", CPLX, init="zeros", lifetime="ls"),
+        ]
+        if self.cfg.direction.lower() in ("prplus", "dy"):
+            specs.append(BufSpec("g_prev", "image", "per_shard", "image", CPLX, init="zeros"))
+
+        # Use deterministic planning (no micro-bench). Keeps shard splits identical
+        # across identical solver instances (e.g., eager vs compiled).
+        self.ws = Workspace(
+            y, nufft_op, arena=self.arena, buf_specs=specs,
+            kspace_mode="sharded", benchmark=False
+        )
+
+        # -------- stats / objective / policy --------
+        if not hasattr(self.ws, "stats"):
+            self.ws.stats = StatsBoard()
+        self.obj = Objective(nufft_op, y, regm)  # uses per‑shard caches if present
+        self.policy = RegPolicy(RegPolicyConfig())
+
+        # Direction
+        dir_name = self.cfg.direction.lower()
+        self.dir = {"fr": DirFR, "prplus": DirPRPlus, "dy": DirDY}[dir_name](self.ws)
+
+        # Expose LS knobs for numerics.line_search
+        self.ls_name     = self.cfg.ls_name
+        self.c1          = float(self.cfg.c1)
+        self.c2          = float(self.cfg.c2)
+        self.ls_zoom     = bool(self.cfg.ls_zoom)
+        self.ls_max_iter = int(self.cfg.ls_max_iter)
+        self.ls_beta = float(self.cfg.ls_beta)
+
+        # Optional init
+        if self.cfg.init_mode == "backproj":
+            try:
+                from ..ops.init_scaling import initial_backproj_and_scaling
+                initial_backproj_and_scaling(
+                    self.ws, self.regm, xfactor=self.cfg.backproj_xfactor,
+                    verbose=self.cfg.verbose
+                )
+            except Exception:
+                pass
+        elif self.cfg.init_mode == "zero":
+            for _, i in self.ws.iter_shards():
+                self.ws.get("var", i).zero_()
+        # "keep" -> assume caller filled ws.x or zeros
+
+        # Publish initial x-written events for halo safety
+        try:
+            self.ws.mark_x_written()
+        except Exception:
+            pass
+
+        # Pre‑allocate scalar slots needed by solver/policy (compile‑friendly)
+        try:
+            preallocate_stats(self.ws.stats, self.regm, self.arena, self.y)
+        except Exception:
+            pass
+
+        # State
+        self.iter = 0
+
+    # ------------------ main loop ------------------
+
+    @torch.no_grad()
+    def run(self,
+            max_iter: Optional[int] = None,
+            tol_g: Optional[float] = None,
+            tol_step: Optional[float] = None) -> "CGSolver":
+        """
+        Execute CG iterations with Armijo (default) or Wolfe line‑search.
+        Continuation is applied after accepting a step, using newly collected stats.
+        """
+        max_iter = int(max_iter or self.cfg.max_iter)
+        tol_g    = float(tol_g if tol_g is not None else self.cfg.tol_g)
+        tol_step = float(tol_step if tol_step is not None else self.cfg.tol_step)
+
+        ws, obj = self.ws, self.obj
+        dtype_r = self.y.real.dtype
+
+        # --- prime gradient at t=0 and set steepest‑descent direction
+        obj.begin_linesearch(ws)
+        try:
+            # fills ws.g at x
+            _f0, _g0d = obj.f_g_tensor(ws, torch.zeros((), device=self.y.device, dtype=dtype_r))
+            for _, i in ws.iter_shards():
+                g, d, D = ws.bind(i, "grad", "dir", "diag")
+                d.copy_(g).div_(D).neg_()
+            try:
+                self.dir.init_state()  # seed direction state (e.g., g_prev)
+            except Exception:
+                pass
+        finally:
+            obj.end_linesearch(ws)
+
+        # ----------------- iteration loop -----------------
+        for k in range(max_iter):
+            self.iter = k
+
+            # ---- line‑search (objective keeps heavy ops on device) ----
+            ok, t, f_t, gdot_t = line_search(self)  # all 0‑D tensors
+            ok_bool = bool(ok.item()) if isinstance(ok, torch.Tensor) else bool(ok)
+            if not ok_bool:
+                if self.cfg.verbose:
+                    print(f"[cg] line‑search failed at iter {k}")
+                break
+
+            # ---- accept step: x <- x + t·dx
+            for _, i in ws.iter_shards():
+                x, d = ws.bind(i, "var", "dir")
+                x.add_(d * t.to(x.device, dtype=d.real.dtype))
+
+            # ---- collect and record per‑iterate stats (accepted‑only)
+            try:
+                sb = getattr(ws, "stats", None)
+                if sb is not None:
+                    xn = xnorm0(ws)
+                    sn = stepnorm0(ws)
+                    gn = gnorm_precond0(ws)
+                    sb.scalar_slot("xnorm",    xn.device, xn.dtype).add_(xn)
+                    sb.scalar_slot("stepnorm", sn.device, sn.dtype).add_(sn)
+                    sb.scalar_slot("gnorm",    gn.device, gn.dtype).add_(gn)
+                    if self.cfg.record_history:
+                        sb.record_step()
+            except Exception:
+                pass
+
+            # ---- continuation based on *accepted* iterate
+            try:
+                self.policy.prepare_collection(ws, self.regm)  # enable reg‑side stats
+                changed = self.policy.update_from_stats(ws, self.regm)
+            except Exception:
+                pass
+
+            # ---- convergence (tensor-native; return Python bool)
+            if converged(ws, tol_g=tol_g, tol_step=tol_step):
+                if self.cfg.verbose:
+                    print(f"[cg] converged at iter {k}")
+                break
+
+            # ---- direction update for next iteration
+            try:
+                self.dir.update_inplace(ws)
+            except Exception:
+                # fallback: steepest descent if direction update fails
+                for _, i in ws.iter_shards():
+                    g, d, D = ws.bind(i, "grad", "dir", "diag")
+                    d.copy_(g).div_(D).neg_()
+
+        return self
+
+    # ------------------ results / history ------------------
+
+    @torch.no_grad()
+    def result(self) -> torch.Tensor:
+        """Concatenate shards of the variable."""
+        return self.ws.concat("var").detach()
+
+    @torch.no_grad()
+    def history(self):
+        """
+        Accepted‑only history via StatsBoard snapshots.
+        Falls back to a one‑record snapshot at t=0 if none recorded.
+        """
+        sb = getattr(self.ws, "stats", None)
+        if sb is not None and self.cfg.record_history:
+            hist = history_from_stats(sb)
+            if hist:
+                return hist
+
+        # Fallback snapshot (no steps recorded)
+        ws, obj = self.ws, self.obj
+        dev, rdt = self.y.device, self.y.real.dtype
+        obj.begin_linesearch(ws)
+        try:
+            t0 = torch.zeros((), device=dev, dtype=rdt)
+            f0, g0d = obj.f_g_tensor(ws, t0)
+        finally:
+            obj.end_linesearch(ws)
+
+        xn = xnorm0(ws)
+        sn = stepnorm0(ws)
+        gn = gnorm_precond0(ws)
+        return [dict(
+            iter=int(self.iter),
+            f=float(f0.detach().cpu()),
+            gdot=float(g0d.detach().cpu()),
+            step=0.0,
+            xnorm=float(xn.detach().cpu()),
+            gnorm=float(gn.detach().cpu()),
+            stepnorm=float(sn.detach().cpu()),
+        )]

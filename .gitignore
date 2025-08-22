@@ -213,9 +213,16 @@ __marimo__/
 *.npy
 *.pt
 *.pth
-*.py
+/*.py
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+.env/
 # Allow Python sources in tests directory
-!tests/**/*.py
+!*/**/*.py
+!*/*.py
 # Large experiment outputs
 checkpoints/
 results/
