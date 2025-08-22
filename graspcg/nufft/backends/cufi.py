@@ -259,19 +259,17 @@ class CuFiNUFFTAdapter:
         spatial = self._spatial(); K = self._K; maps = self._maps
         Cmaps = int(self._im_shape[0])
 
-        # Parse shapes  (correct ranks: (2+ndim) for (B,Cin,*S), (3+ndim) for (B,L,Cin,*S))
-        if x.ndim == (2 + self.ndim):         # (B,Cin,spatial)
-            B, Cin = int(x.shape[0]), int(x.shape[1])
-            L = 1
+        # Parse shapes
+        if x.ndim == (3 + self.ndim):         # (B,Cin,spatial)
+            B, Cin = int(x.shape[0]), int(x.shape[1]); L = 1
             x_view = x
             need = (B, Cmaps, K)
-        elif x.ndim == (3 + self.ndim):       # (B,L,Cin,spatial)
+        elif x.ndim == (4 + self.ndim):       # (B,L,Cin,spatial)
             B, L, Cin = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
             x_view = x
             need = (B, L, Cmaps, K)
         else:
-            raise ValueError(f"x must be (B,C,spatial) or (B,L,C,spatial); got shape {tuple(x.shape)} for ndim={self.ndim}")
-
+            raise ValueError("x must be (B,C,spatial) or (B,L,C,spatial)")
         if Cin not in (1, Cmaps):
             raise ValueError(f"image coil slot must be 1 (coil‑combined) or C={Cmaps}; got {Cin}")
 

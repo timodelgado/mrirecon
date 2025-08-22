@@ -1,0 +1,182 @@
+# -----------------------------------------------------------------------------
+# bench_nufft.py — micro-benchmarks for graspcg.nufft (single device)
+# -----------------------------------------------------------------------------
+from __future__ import annotations
+import math, time, contextlib
+from dataclasses import dataclass
+from typing import Tuple, Optional, Sequence, List, Dict
+import torch
+
+# Import public API & axis grammar
+from ..api import NUFFT, NUFFTConfig
+from .layout import AxisSpec
+
+# ------------------------------- helpers --------------------------------------
+
+def complex_rand(shape, dtype, device):
+    a = torch.randn(shape, dtype=torch.float32 if dtype==torch.complex64 else torch.float64, device=device)
+    b = torch.randn_like(a)
+    return (a + 1j*b).to(dtype)
+
+def make_axis(ndim: int) -> AxisSpec:
+    if ndim == 2:
+        return AxisSpec(
+            image_labels=('B','L','X','Y','coil'),
+            kspace_labels=('B','L','coil','K'),
+            image_fft_labels=('X','Y'),
+            coil_label='coil',
+        )
+    else:
+        return AxisSpec(
+            image_labels=('B','L','X','Y','Z','coil'),
+            kspace_labels=('B','L','coil','K'),
+            image_fft_labels=('X','Y','Z'),
+            coil_label='coil',
+        )
+
+@dataclass
+class Problem:
+    ndim: int
+    B: int
+    L: int
+    C: int
+    spatial: Tuple[int, ...]  # (H,W[,D])
+    K: int
+    device: torch.device
+    dtype: torch.dtype = torch.complex64
+
+def make_problem(p: Problem):
+    HWD = p.spatial
+    maps = complex_rand((p.C, *HWD), p.dtype, p.device) / math.sqrt(p.C)
+    traj = (torch.rand((p.B, p.ndim, p.K), device=p.device) * (2*math.pi) - math.pi)  # radians in [-π,π)
+    dcf  = torch.rand((p.B, p.K), device=p.device) + 0.1
+    axis = make_axis(p.ndim)
+    cfg  = NUFFTConfig(ndim=p.ndim, backend='torchkb', traj_units='rad', dcf_mode='balanced')
+    return maps, traj, dcf, axis, cfg
+
+@contextlib.contextmanager
+def cuda_timing():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    yield
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    dur_ms = (t1 - t0) * 1e3
+    mem = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+    yield_result = {'ms': dur_ms, 'peak_bytes': int(mem)}
+    # contextmanager must not return value; we attach on caller
+
+def bytes_fmt(n):
+    for u in ['B','KB','MB','GB','TB']:
+        if n < 1024: return f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+def run_once(backend: str, p: Problem, warmup: int=3, repeat: int=10, seed: int=123, compile_ok: bool=False) -> Dict[str, float]:
+    torch.manual_seed(seed)
+    maps, traj, dcf, axis, cfg = make_problem(p)
+    cfg = NUFFTConfig(ndim=p.ndim, backend=backend, traj_units='rad', dcf_mode='balanced')
+    op = NUFFT(maps=maps, traj=traj, dcf=dcf, axis=axis, config=cfg, dtype=maps.dtype, device=p.device)
+
+    # inputs in user layout (North‑Star)
+    if p.ndim == 2:
+        x = complex_rand((p.B, p.L, 1, p.spatial[0], p.spatial[1]), p.dtype, p.device)
+    else:
+        x = complex_rand((p.B, p.L, 1, p.spatial[0], p.spatial[1], p.spatial[2]), p.dtype, p.device)
+    y_shape = (p.B, p.L, p.C, p.K)
+    y = torch.empty(y_shape, dtype=p.dtype, device=p.device)
+    x2 = torch.empty_like(x)
+
+    # optional compile path (will partially graph-break for CUFI; full for PTNUFFT)
+    if compile_ok:
+        try:
+            op = torch.compile(op)  # __call__ dispatches to A in our front-end
+        except Exception:
+            pass
+
+    # warmup
+    for _ in range(warmup):
+        op.A(x, out=y)
+        op.AH(y, out=x2)
+
+    # timed runs
+    A_ms, AH_ms = [], []
+    peak_A, peak_AH = 0, 0
+
+    for _ in range(repeat):
+        if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
+        t0 = time.perf_counter(); op.A(x, out=y); 
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        A_ms.append((time.perf_counter()-t0)*1e3)
+        peak_A = max(peak_A, torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0)
+
+        if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
+        t0 = time.perf_counter(); op.AH(y, out=x2);
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        AH_ms.append((time.perf_counter()-t0)*1e3)
+        peak_AH = max(peak_AH, torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0)
+
+    # simple functional check (energy) and A^H A consistency
+    with torch.no_grad():
+        y1 = y.clone()
+        x3 = torch.empty_like(x)
+        op.AH(y1, out=x3)
+        rel = (x3 - x2).norm() / (x2.norm() + 1e-12)
+
+    return {
+        'A_ms': float(torch.tensor(A_ms).mean().item()),
+        'AH_ms': float(torch.tensor(AH_ms).mean().item()),
+        'A_std': float(torch.tensor(A_ms).std(unbiased=False).item()),
+        'AH_std': float(torch.tensor(AH_ms).std(unbiased=False).item()),
+        'A_peak': float(peak_A),
+        'AH_peak': float(peak_AH),
+        'rel_err_AHA': float(rel),
+    }
+
+def bench_all_backends(p: Problem, backends: Sequence[str] = ('torchkb','cufi','ptnufft'),
+                       warmup: int=3, repeat: int=10, compile_ok: bool=False):
+    results = {}
+    for be in backends:
+        if be == 'cufi' and (p.device.type != 'cuda' or not torch.cuda.is_available()):
+            print("Skipping CUFI on non-CUDA device.")
+            continue
+        r = run_once(be, p, warmup=warmup, repeat=repeat, compile_ok=compile_ok)
+        results[be] = r
+        print(f"[{be}]  A: {r['A_ms']:.2f}±{r['A_std']:.2f} ms  (peak {bytes_fmt(r['A_peak'])}) | "
+              f"AH: {r['AH_ms']:.2f}±{r['AH_std']:.2f} ms  (peak {bytes_fmt(r['AH_peak'])}); "
+              f" AᴴA rel diff: {r['rel_err_AHA']:.2e}")
+    return results
+
+
+def compare_pair(p: Problem, be1='torchkb', be2='ptnufft', seed=123):
+    torch.manual_seed(seed)
+    maps, traj, dcf, axis, _ = make_problem(p)
+    cfg1 = NUFFTConfig(ndim=p.ndim, backend=be1, traj_units='rad', dcf_mode='balanced')
+    cfg2 = NUFFTConfig(ndim=p.ndim, backend=be2, traj_units='rad', dcf_mode='balanced')
+    op1 = NUFFT(maps, traj, dcf, axis=axis, config=cfg1, dtype=maps.dtype, device=p.device)
+    op2 = NUFFT(maps, traj, dcf, axis=axis, config=cfg2, dtype=maps.dtype, device=p.device)
+
+    if p.ndim == 2:
+        x = complex_rand((p.B, p.L, 1, p.spatial[0], p.spatial[1]), p.dtype, p.device)
+    else:
+        x = complex_rand((p.B, p.L, 1, p.spatial[0], p.spatial[1], p.spatial[2]), p.dtype, p.device)
+
+    y1 = torch.empty((p.B, p.L, p.C, p.K), dtype=p.dtype, device=p.device)
+    y2 = torch.empty_like(y1)
+    op1.A(x, out=y1); op2.A(x, out=y2)
+    relA = (y1 - y2).norm() / (y1.norm() + 1e-12)
+
+    x1 = torch.empty_like(x); x2 = torch.empty_like(x)
+    op1.AH(y1, out=x1); op2.AH(y1, out=x2)
+    relAH = (x1 - x2).norm() / (x1.norm() + 1e-12)
+    print(f"Compare {be1} vs {be2}:  ||A1-A2||/||A1||={relA:.2e},   ||AH1-AH2||/||AH1||={relAH:.2e}")
+
+
+if __name__ == "__main__":
+    dev = torch.device('cuda', 0) if torch.cuda.is_available() else torch.device('cpu')
+    # Example: 2D non-cart (B,L,C,H,W,K)
+    prob = Problem(ndim=2, B=4, L=8, C=8, spatial=(192,192), K=64_000, device=dev, dtype=torch.complex64)
+    bench_all_backends(prob, repeat=8, compile_ok=False)

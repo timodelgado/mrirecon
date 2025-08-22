@@ -306,33 +306,19 @@ class TorchKbNUFFTAdapter:
                 yw = y[sl] if w_all is None else (y[sl] * w_all[sl].unsqueeze(1))
                 y_flat = yw.reshape(b * Cmaps, 1, K)
                 om_rep = om_all[sl].repeat_interleave(Cmaps, dim=0)
-                x_flat = self._adj(y_flat, om_rep)  # expected (b*C,1,*S) or (b*C,*S)
-
-                # Ensure we drop the singleton channel before reshaping to (b,C,*S)
-                if x_flat.ndim == (3 + self.ndim):
-                    x_flat = x_flat.squeeze(1)  # (b*C,*S)
-                elif x_flat.ndim != (2 + self.ndim):
-                    raise RuntimeError(f"Unexpected KbNufftAdjoint output rank {x_flat.ndim} for ndim={self.ndim}")
-
-                x_c = x_flat.reshape(b, Cmaps, *spatial)  # (b,C,*S)
-                x_sum = (x_c * torch.conj(self._maps).unsqueeze(0)).sum(dim=1, keepdim=True)  # (b,1,*S)
+                x_flat = self._adj(y_flat, om_rep)                 # (b*C,1,*S)
+                if x_flat.ndim == 5: x_flat = x_flat  # (b*C,1,*S)
+                x_c = x_flat.reshape(b, Cmaps, *spatial)
+                x_sum = (x_c * torch.conj(self._maps).unsqueeze(0)).sum(dim=1, keepdim=True)
                 x_out[sl].copy_(x_sum.to(dtype=y.dtype))
-
             else:
                 yw = y[sl] if w_all is None else (y[sl] * w_all[sl].unsqueeze(1).unsqueeze(1))
                 y_flat = yw.reshape(b * L * Cmaps, 1, K)
                 om_rep = om_all[sl].repeat_interleave(L * Cmaps, dim=0)
-                x_flat = self._adj(y_flat, om_rep)  # expected (b*L*C,1,*S) or (b*L*C,*S)
-
-                if x_flat.ndim == (3 + self.ndim):
-                    x_flat = x_flat.squeeze(1)  # (b*L*C,*S)
-                elif x_flat.ndim != (2 + self.ndim):
-                    raise RuntimeError(f"Unexpected KbNufftAdjoint output rank {x_flat.ndim} for ndim={self.ndim}")
-
-                x_lc = x_flat.reshape(b, L, Cmaps, *spatial)  # (b,L,C,*S)
-                x_like = (x_lc * torch.conj(self._maps).view(1, 1, Cmaps, *spatial)).sum(dim=2, keepdim=True)  # (b,L,1,*S)
+                x_flat = self._adj(y_flat, om_rep)                 # (b*L*C,1,*S)
+                x_lc = x_flat.reshape(b, L, Cmaps, *spatial)
+                x_like = (x_lc * torch.conj(self._maps).view(1, 1, Cmaps, *spatial)).sum(dim=2, keepdim=True)
                 x_out[sl].copy_(x_like.to(dtype=y.dtype))
-
 
         return x_out
 
